@@ -233,6 +233,13 @@ g0 does <code>QK&#8320;</code> then a <code>phase_barrier()</code> before softma
   <li><b>MFMA bursts chain without a drain</b>: each burst's tail reads the next burst's first operands from LDS (<code>PREFETCH_DEPTH=2</code>: the MFMA at unit <i>u</i> uses operands read two MFMAs ago, hiding one <code>ds_read</code> latency).</li>
   <li><b>Cross-group buffer hazards</b> are resolved by the phase alternation itself (g0 and g1 are never in the same phase), except iteration 0 which has no leading barrier &mdash; hence the explicit extra barrier there.</li>
   <li><b>Softmax is moved off the critical path</b>: the softmax scale rides in the QK MFMA's e8m0 operand, the L reduction runs on the matrix core ("ones column"), so the VALU phase is just max / exp2 / pack and fits inside the partner's MFMA burst.</li>
+  <li><b>exp2 without a transcendental: the Schraudolph trick.</b> An IEEE float's bit pattern is roughly an affine function of its log<sub>2</sub>: the exponent field holds the integer part, the mantissa the fraction. So writing the integer
+      <code>2<sup>23</sup>&middot;x + 2<sup>23</sup>&middot;(127 &minus; &epsilon;)</code> and reading it back as an f32 gives &asymp; 2<sup>x</sup> (exact at integers, linear in between; &epsilon; &asymp; 0.058 minimises the RMS error, ~1.8%).
+      In the kernel the whole exp becomes <b>one affine map plus one dtype conversion</b>: the 2<sup>23</sup>&middot;log<sub>2</sub>e&middot;scale factor is folded into the QK MFMA's scale, the bias minus the frozen max is added once per row, and the exp itself is a single <code>v_cvt_u32_f32</code> whose bits are reinterpreted as f32, then packed to fp8.
+      The saturating convert maps negative patterns (and NaN) to 0, so it doubles as the clamp and the mask. The error is small next to fp8's own quantisation error of P.
+      <pre>p = bitcast_f32( cvt_u32( 2^23&middot;log2(e)&middot;scale&middot;s + 2^23&middot;(127 &minus; &epsilon;) &minus; m ) )   <span class="c"># m = frozen row max in the same units;  p &asymp; exp(scale&middot;s &minus; max)</span></pre>
+      For the derivation, the choice of proxy width (U32 / U16 / U8), the frozen max with rollback and the accuracy measurements, see
+      <a href="https://arxiv.org/pdf/2611.09225">Wu, Korhonen &amp; Carabano Bravo, <i>Fused-Softmax for efficient quantized attention</i>, arXiv 2611.09225</a> (&sect;4.1&ndash;4.2).</li>
 </ul>
 </div>
 
@@ -931,7 +938,8 @@ This is the whole ping-pong kernel: the sigma LUT is the largest single contribu
 <h1>Ping-pong on a gather-bound kernel: GLM-5.3-Flash sparse MLA prefill</h1>
 <div class="sub">Applying the ping-pong schedule to a kernel whose bottleneck is the memory system, not the matrix core. MI300X / MI325X (gfx942), bf16, H=16, D=512, top-k=2048.
 Compared with a one-query-per-workgroup baseline and with a non-ping-pong FlyDSL kernel (Yash's).
-Code and benchmark: <a href="https://github.com/ROCm/aiter/tree/ws/glm53-sparse-mla-flydsl">ROCm/aiter, branch <code>ws/glm53-sparse-mla-flydsl</code></a>.</div>
+Code: <a href="https://github.com/hellozhuo-amd/aiter/tree/zhuo/pp-glm53-sparse-mla">hellozhuo-amd/aiter, branch <code>zhuo/pp-glm53-sparse-mla</code></a> (<code>aiter/ops/flydsl/kernels/sparse_mla_pp.py</code>).
+Yash's kernel: <a href="https://github.com/ROCm/aiter/tree/ws/glm53-sparse-mla-flydsl">ROCm/aiter, branch <code>ws/glm53-sparse-mla-flydsl</code></a>.</div>
 
 <div class="note">Intermediate numbers are development A/Bs, interleaved against the one-query kernel on the same day (MI300X unless stated, older FlyDSL for the early steps); the final rows are on MI325X / MI300X with FlyDSL 0.5.0, so compare ratios within a row, not ms across rows.</div>
 
@@ -964,7 +972,9 @@ PV   acc += P &middot; V_tile     <span class="c"># 16 x 512 update, MFMA; V = t
 </div>
 <p>So although the kernel appears to fetch 2048 &times; 16384 = <b>33.5 M rows (34.4 GB)</b>, they are drawn from 131K rows. Compulsory HBM traffic is 128 MiB, about 22 &micro;s at 6 TB/s, so <b>HBM bandwidth is not the bottleneck</b>. The data path is HBM &rarr; Infinity Cache &rarr; L2 &rarr; L1 &rarr; LDS, and the limit is the Infinity-Cache bandwidth and the L2 hit rate. (The measured effective bandwidth, 6.5&ndash;9 TB/s, exceeds the HBM peak for exactly this reason.)</p>
 <p><b>Benchmark ("paged")</b>: the full 3640 &times; 1152 pool, one 131K-token request on 114 randomly placed pages, chunk = the last T = 16384 positions, causal top-k of 2048 rows per token, cache flushed, fp32-oracle checked (max err 1.23e-3).
-Run on the reference branch with:</p>
+Run on the ping-pong branch with (times the ping-pong kernel against Yash's, both checked against an fp32 oracle):</p>
+<pre>python3 op_tests/op_benchmarks/flydsl/bench_sparse_mla_pp.py</pre>
+<p>Yash's kernel on its own branch:</p>
 <pre>python3 op_tests/test_flydsl_sparse_mla.py --suite performance -t 16384 --order logical topk -s 0 1</pre>
 <p>Target: with no shared rows, beat 10.36 ms and get close to 5.7 ms.</p>
 <p class="neu">Reuse of identical top-k lists across tokens (which some serving runs show) is a separate path handled by the Q-block kernel; this page is the one-list-per-token case (G = 1), which is what the real-model A/B hit.</p>
@@ -1058,6 +1068,7 @@ The problem is the long yellow-VMEM and grey-WAIT stretches in the memory phase:
 <tr><td>Make phase M cheap</td><td>Build V<sup>T</sup> in phase M with <b>identity MFMAs</b> on the registers that already fed QK (x&middot;1.0 is exact) instead of an LDS write + transposed read in phase V; park some Q fragments in LDS to pay for the extra live registers (otherwise it spills); spread the gather loads through the softmax instead of one burst; keep the packed-FP32 vectoriser off.</td><td class="pos">0.974 &rarr; ~0.95</td></tr>
 <tr><td>Make the gather efficient (the real bottleneck)</td><td>Hardware counters showed the gather bound <em>inside the CU</em>: in MFMA operand order the four lanes reading one row are 16 lanes apart, so the address unit cannot merge them and L1 spent 65% of its time on tag conflicts. Fix: a <b>coalescable gather</b> (consecutive lanes read consecutive chunks of a row) followed by <code>ds_bpermute</code> into MFMA order, with the permutes <b>interleaved one-by-one with the MFMAs</b> so the matrix core never waits for all of them. Then gather only one tile ahead into the register buffer M just drained: more cycles, but fewer VGPRs and a higher clock under the power cap.</td><td class="pos"><b>~0.95 &rarr; 0.815</b></td></tr>
 <tr><td>A steady stream of loads in both phases (an idea from Yash's kernel)</td><td>Issue half of the next tile's gather in phase M, each load right after the permute that frees its register, the other half in phase V. Both groups now issue loads in both phases, one every few MFMAs, instead of V-only bursts.</td><td class="pos"><b>0.618</b> (MI325X)</td></tr>
+<tr><td>More tricks from Yash's kernel</td><td>Immediate-offset gathers (one base register per gathered row, the chunk offset in the load's immediate field, so no per-load address VALU); the V<sup>T</sup> packs pinned in phase V so the compiler cannot sink them into the MFMA burst; the freed registers keep more Q fragments out of LDS.</td><td class="pos">a further 0.978x (MI300X)</td></tr>
 <tr><td>Neutral</td><td>Spreading the parked-Q reads through the burst; an XCD-aware token remap so concurrent workgroups on one L2 take adjacent tokens (neutral on synthetic lists, aimed at real indexer output).</td><td class="neu">~1.00</td></tr>
 </table>
 <p class="neu">The load-stream step on other setups (MI325X, flydsl 0.5.0): paged 2 requests 4433 &rarr; 4068 (0.918); shuffled lists 6248 &rarr; 6366 (1.019, slightly worse); <b>uniform 4 GiB (HBM-bound) 7370 &rarr; 8337 (1.131, a regression)</b>: there the loads stall at issue and in M a stalled load blocks the MFMAs behind it.</p>
@@ -1100,6 +1111,9 @@ The problem is the long yellow-VMEM and grey-WAIT stretches in the memory phase:
 <h2>8. Traces: what moved</h2>
 <figure class="slotfig dark"><img src="spmla_pp_trace_balanced.png" alt="WaveScope trace of the ping-pong after the gather work" loading="lazy">
 <figcaption><b>Ping-pong after the gather / coalescing work</b> (~2.5 K cycles shown). The two phases have become more balanced, but there are still a lot of stalls (red STALL ticks, grey WAIT, long yellow VMEM blocks on some waves), which means there is still room for improvement.</figcaption></figure>
+<figure class="slotfig dark"><img src="spmla_pp_trace_final.png" alt="WaveScope trace of the final ping-pong kernel" loading="lazy">
+<figcaption><b>Final ping-pong kernel</b> (~4 K cycles shown, 8 resident waves = 4 SIMDs &times; W0/W1). The skew is clean on every SIMD: while one wave runs its dense MFMA phase, its partner finishes the much shorter V phase and then sits in a long grey WAIT at the barrier.
+Measured on the same build, phase M is ~1480 cy and waits ~25 cy at the barrier, while phase V is ~700 cy and waits ~800 cy: the period is ~2 &times; M. With the loads now spread through both phases, <b>phase M (the MFMA burst and its permutes) is the critical path</b>, so further gains have to come from M, not from the memory side.</figcaption></figure>
 
 <!-- ============================================================ -->
 <h2>9. Results</h2>
@@ -1113,19 +1127,21 @@ The problem is the long yellow-VMEM and grey-WAIT stretches in the memory phase:
 </table>
 <p class="neu">&ldquo;TB/s&rdquo; is logical bytes (34.4 GB) / time, so values above the ~6 TB/s HBM peak mean the Infinity Cache is serving the gathers.</p>
 
-<h3>Final comparison: one-query vs Yash's kernel vs ping-pong (MI325X)</h3>
-<p>Yash's kernel (<code>flydsl_sparse_mla_fwd</code>) is a <b>non-ping-pong</b> design: one wave per token over the full D = 512, AGPR accumulators, no LDS on the register-V<sup>T</sup> route. It tries to get rid of the waits entirely rather than overlap them, and combines the Infinity-Cache insight with his earlier optimisations; he measured ~4.5 ms (no reuse) on the paged bench before sharing it.
-The final ping-pong kernel adds his idea of distributing the <code>buffer_load</code>s evenly across both phases (<code>gather_in_m=4</code>).</p>
+<h3>Final: ping-pong vs the one-query kernel (MI325X)</h3>
 <div class="card bars" id="spfinal"></div>
 <table>
-<tr><th>MI325X, flydsl 0.5.0, paged T=16384, topk=2048</th><th>median &micro;s</th><th>min &micro;s</th><th>TFLOP/s</th><th>effective TB/s</th><th>speed-up vs fly_yash</th></tr>
-<tr><td>one-query kernel (<code>fly_one_q</code>) <span class="neu">(separate run, same setup)</span></td><td>6175</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>0.65x</td></tr>
-<tr><td>Yash's kernel (<code>fly_yash</code>, ordered indices)</td><td>4041.0</td><td>3901.7</td><td>272.1</td><td>8.64</td><td>1.000x</td></tr>
-<tr><td><b>ping-pong, final (<code>fly_pp</code>)</b></td><td class="pos"><b>3836.9</b></td><td class="pos">3783.0</td><td class="pos">286.6</td><td class="pos">9.09</td><td class="pos"><b>1.053x</b></td></tr>
+<tr><th>MI325X, flydsl 0.5.0, paged T=16384, topk=2048</th><th>median &micro;s</th><th>min &micro;s</th><th>TFLOP/s</th><th>effective TB/s</th><th>speed-up vs one_q</th></tr>
+<tr><td>one-query kernel (<code>fly_one_q</code>)</td><td>6175</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>1.00x</td></tr>
+<tr><td><b>ping-pong (<code>fly_pp</code>, with the load stream)</b></td><td class="pos"><b>3836.9</b></td><td class="pos">3783.0</td><td class="pos">286.6</td><td class="pos">9.09</td><td class="pos"><b>1.61x</b></td></tr>
 </table>
-<p class="neu">Both kernels pass the fp32 oracle (max |err| 1.23e-3). Against the one-query kernel the final ping-pong is 6175 / 3837 = <b>1.61x</b> faster (the one_q number is from a separate run of the same setup).
-Effective TB/s is logical bytes (34.4 GB) over time, so 9 TB/s means the Infinity Cache serves most of the gathers.</p>
-<p><b>Also on MI300X</b> (flydsl 0.5.0; both are gfx942 and differ mainly in power cap): fly_yash 5125 &micro;s vs fly_pp 5144 &micro;s, <b>0.996x (par)</b>, 6.81 vs 6.78 TB/s. On MI300X Yash's kernel is marginally ahead.</p>
+<p class="neu">Passes the fp32 oracle (max |err| 1.23e-3). Effective TB/s is logical bytes (34.4 GB) over time, so 9 TB/s means the Infinity Cache serves most of the gathers. The last ladder step (more of Yash's tricks) takes a further ~2% off on MI300X.</p>
+
+<h3>Against Yash's kernel</h3>
+<div class="card">
+<p>Yash's kernel (<code>flydsl_sparse_mla_fwd</code>) is a <b>non-ping-pong</b> design: one wave per token over the full D = 512, AGPR accumulators, no LDS on the register-V<sup>T</sup> route. It gets rid of the waits outright rather than overlapping them.
+The two kernels traded ideas in both directions (the steady load stream and the immediate-offset gathers came from his kernel into the ping-pong one), and the ping-pong kernel was briefly ahead.
+<b>Yash's latest kernel is about 5% faster than the final ping-pong kernel.</b> The trace above suggests why: the ping-pong period is now ~2 &times; phase M, and the barrier that keeps the skew also makes every wave pay for it, while the one-wave-per-token design has no barriers at all.</p>
+</div>
 
 <!-- ============================================================ -->
 <h2>10. Takeaways</h2>
@@ -1135,7 +1151,7 @@ Effective TB/s is logical bytes (34.4 GB) over time, so 9 TB/s means the Infinit
   <li><b>But the schedule is only the structure.</b> The first version was 0.974x; almost all the gain came from making the <em>gather</em> efficient: coalescable loads so the L1 stops tag-conflicting (0.944x), interleaving the fix-up with the MFMAs (0.917x), and spreading loads through both phases (0.749x on MI325X).</li>
   <li><b>Read the counters, not just the trace.</b> The stall was inside the CU (TA 95% busy, 65% tag conflicts), not in the fabric. After the fix it moved to L1-waiting-on-L2, and further issue-order games bought nothing.</li>
   <li><b>On a power-capped part, judge by energy per tile.</b> The depth-1 prefetch needed 7% more cycles and still won, through a higher clock; fewer-cycles changes can lose the same way.</li>
-  <li><b>Ping-pong is not the only way to hide waits.</b> Yash's one-wave-per-token kernel reaches the same level by removing the waits outright. The ping-pong version has the clearer structure and is easier to steer (&ldquo;the pp pipeline has better visualization&rdquo;), and the best ideas moved across: his steady stream of loads cut the ping-pong kernel's time by 25% on MI325X (5096 &rarr; 3814 &micro;s).</li>
+  <li><b>Ping-pong is not the only way to hide waits, and here not the fastest.</b> Yash's barrier-free, one-wave-per-token kernel ends up ~5% faster. The ping-pong version has the clearer structure and is easier to reason about in a trace, and the best ideas moved across: his steady stream of loads cut the ping-pong kernel's time by 25% on MI325X (5096 &rarr; 3814 &micro;s).</li>
   <li><b>Check the regimes it does not help.</b> Ping-pong needs full occupancy (T &gt; ~4K); it regresses for tiny T, L2-resident data, shuffled lists and the HBM-bound 4 GiB uniform stress case.</li>
 </ol>
 </div>
@@ -1334,9 +1350,9 @@ Effective TB/s is logical bytes (34.4 GB) over time, so 9 TB/s means the Infinit
 <script>
 (function(){
   const host=document.getElementById('spfinal'); if(!host) return;
-  [["one-query kernel",6175,"#6f7686"],["Yash's kernel (non-pp)",4041,"#6ea8fe"],["ping-pong, final",3836.9,"#8de8a0"]].forEach(([l,v,c])=>{
+  [["one-query kernel",6175,"#6f7686"],["ping-pong, with the load stream",3836.9,"#8de8a0"]].forEach(([l,v,c])=>{
     const d=document.createElement('div'); d.className='bar';
-    d.innerHTML='<div class="lb" style="width:200px">'+l+'</div><div class="fill" style="width:'+(v/6500*55)+'%;background:'+c+'"></div><div class="v">'+v.toFixed(0)+' &micro;s</div>';
+    d.innerHTML='<div class="lb" style="width:260px">'+l+'</div><div class="fill" style="width:'+(v/6500*55)+'%;background:'+c+'"></div><div class="v">'+v.toFixed(0)+' &micro;s</div>';
     host.appendChild(d);
   });
 })();
