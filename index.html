@@ -1,0 +1,1359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ping-pong scheduling for attention kernels on AMD Instinct GPUs</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --fg:#e6e8ee; --dim:#9aa3b2; --acc:#6ea8fe; --mfma:#ff9b9b; --valu:#8de8a0; --bar:#c9c9c9; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,Segoe UI,Roboto,sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:32px 24px 80px; }
+  h1 { font-size:2rem; margin:0 0 4px; }
+  h2 { margin:48px 0 12px; padding-top:12px; border-top:1px solid #2a2f3a; font-size:1.4rem; }
+  h3 { margin:24px 0 8px; font-size:1.1rem; color:var(--acc); }
+  .sub { color:var(--dim); margin-bottom:24px; }
+  .card { background:var(--card); border:1px solid #2a2f3a; border-radius:10px; padding:16px 20px; margin:16px 0; }
+  figure { margin:20px 0; }
+  figure img { width:100%; height:auto; border-radius:8px; border:1px solid #2a2f3a; background:#fff; }
+  figure.dark img { background:#0b0d12; }
+  figcaption { color:var(--dim); font-size:.9rem; margin-top:8px; }
+  code, pre { font-family:ui-monospace,Consolas,Menlo,monospace; font-size:.88rem; }
+  code { background:#232834; padding:1px 5px; border-radius:4px; }
+  pre { background:#0b0d12; border:1px solid #2a2f3a; border-radius:8px; padding:14px; overflow-x:auto; line-height:1.5; }
+  pre .c { color:#7f8a9c; } pre .k { color:#c792ea; } pre .h { color:#ffcb6b; }
+  table { border-collapse:collapse; width:100%; margin:12px 0; font-size:.93rem; }
+  th, td { border:1px solid #2a2f3a; padding:6px 10px; text-align:left; vertical-align:top; }
+  th { background:#1d212b; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:800px){ .row{ grid-template-columns:1fr; } }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:.8rem; color:#111; }
+  .t-m { background:var(--mfma); } .t-v { background:var(--valu); } .t-b { background:var(--bar); }
+  /* animated timeline */
+  .tl { margin:16px 0; }
+  .lane { display:flex; align-items:center; margin:6px 0; }
+  .lane .nm { width:150px; flex:none; color:var(--dim); font-size:.85rem; }
+  .cells { display:flex; flex:1; height:42px; position:relative; }
+  .cell { flex:1; margin-right:2px; border-radius:5px; font-size:.72rem; display:flex; align-items:center; justify-content:center; color:#111; text-align:center; line-height:1.1; padding:0 3px; transition:opacity .25s, outline-color .25s; outline:2px solid transparent; }
+  .cell.m { background:var(--mfma); } .cell.v { background:var(--valu); } .cell.idle { background:#232834; color:var(--dim); }
+  .cell.now { outline-color:#fff; }
+  .barline { display:flex; margin-left:150px; }
+  .barline div { flex:1; margin-right:2px; text-align:center; color:var(--dim); font-size:.75rem; border-right:2px dashed #555; }
+  .ctl { display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  button { background:#232834; color:var(--fg); border:1px solid #3a4150; border-radius:6px; padding:5px 14px; cursor:pointer; font-size:.9rem; }
+  button:hover { background:#2d3444; }
+  #tlnote { color:var(--dim); font-size:.9rem; min-height:3em; }
+  ul { padding-left:1.2em; } li { margin:4px 0; }
+  .hl { color:#ffcb6b; }
+  a { color:var(--acc); }
+
+  /* ---- tabs ---- */
+  nav.tabs { position:sticky; top:0; z-index:10; background:rgba(15,17,21,.95); border-bottom:1px solid #2a2f3a; display:flex; gap:4px; padding:8px 24px 0; backdrop-filter:blur(6px); }
+  nav.tabs button { background:none; border:none; border-bottom:3px solid transparent; border-radius:0; color:var(--dim); padding:10px 18px; font-size:.98rem; }
+  nav.tabs button:hover { color:var(--fg); background:#1a1e27; }
+  nav.tabs button.on { color:var(--fg); border-bottom-color:var(--acc); }
+  section.page { display:none; } section.page.on { display:block; }
+
+  /* ---- hstu page ---- */
+  .eq { font-family:"Cambria Math","STIX Two Math",Georgia,serif; font-size:1.05rem; background:#0b0d12; border:1px solid #2a2f3a; border-radius:8px; padding:12px 18px; margin:12px 0; line-height:1.9; overflow-x:auto; }
+  .eq .n { color:var(--dim); float:right; font-size:.8rem; font-family:sans-serif; }
+  .eq i { font-style:italic; }
+  .slot { border:2px dashed #4a5163; border-radius:10px; padding:28px 16px; text-align:center; color:var(--dim); background:#12151c; }
+  .slot b { color:#ffcb6b; font-family:ui-monospace,monospace; }
+  figure.slotfig { margin:20px 0; }
+  figure.slotfig img { background:#0b0d12; }
+  footer { max-width:1100px; margin:0 auto; padding:0 24px 48px; color:var(--dim); font-size:.9rem; border-top:1px solid #2a2f3a; }
+  .ph-table td.ph { color:#ffcb6b; text-align:center; }
+  .pos { color:#8de8a0; } .neg { color:#ff9b9b; } .neu { color:var(--dim); }
+  table.tricks td:first-child { white-space:nowrap; font-family:ui-monospace,monospace; font-size:.82rem; }
+  table.tricks tr.grp td { background:#1d212b; color:var(--acc); font-weight:600; font-family:inherit; }
+  .bars .bar { display:flex; align-items:center; margin:3px 0; font-size:.82rem; }
+  .bars .bar .lb { width:310px; flex:none; color:var(--dim); }
+  .bars .bar .fill { height:16px; background:linear-gradient(90deg,#4f7bd9,#6ea8fe); border-radius:3px; }
+  .bars .bar .v { margin-left:8px; font-family:ui-monospace,monospace; }
+  .note { border-left:3px solid #ffcb6b; padding:4px 12px; color:var(--dim); margin:12px 0; background:#14171e; }
+  .twocol { display:grid; grid-template-columns:1fr 1fr; gap:16px; } @media (max-width:800px){ .twocol{grid-template-columns:1fr;} }
+  svg text { fill:#e6e8ee; font-family:sans-serif; }
+
+  /* ---- per-element op flow ---- */
+  .flow { margin:14px 0; }
+  .flow .rowlab { font-weight:600; margin:14px 0 6px; }
+  .flow .rowlab small { color:var(--dim); font-weight:400; margin-left:8px; }
+  .flow .grpwrap { display:flex; align-items:stretch; gap:8px; flex-wrap:wrap; }
+  .flow .grp { border:2px solid; border-radius:10px; padding:6px 8px 8px; }
+  .flow .grp.old { border-color:#ff9b9b; background:rgba(255,155,155,.06); }
+  .flow .grp.new { border-color:#8de8a0; background:rgba(141,232,160,.06); }
+  .flow .grp.same { border:2px dashed #4a5163; }
+  .flow .cap { font-size:.78rem; margin-bottom:6px; text-align:center; }
+  .flow .old .cap { color:#ff9b9b; } .flow .new .cap { color:#8de8a0; } .flow .same .cap { color:var(--dim); }
+  .flow .chips2 { display:flex; align-items:center; gap:4px; }
+  .flow .op { border-radius:7px; padding:6px 9px; color:#111; text-align:center; min-width:104px; }
+  .flow .op b { display:block; font-family:ui-monospace,monospace; font-size:.8rem; }
+  .flow .op i { display:block; font-style:normal; font-size:.72rem; }
+  .flow .op u { display:block; text-decoration:none; font-size:.7rem; opacity:.75; }
+  .flow .op.tr { background:#ff9b9b; min-width:130px; } .flow .op.vl { background:#8de8a0; } .flow .op.ld { background:#ffb454; min-width:130px; } .flow .op.mu { background:#8de8a0; }
+  .flow .ar { color:var(--dim); font-size:1.1rem; }
+  .flow .sum { margin-top:6px; font-size:.86rem; color:var(--dim); }
+  .flow .sum b { color:var(--fg); }
+
+  /* ---- fwd page ---- */
+  .lutw { display:grid; grid-template-columns:minmax(260px,330px) 1fr; gap:16px; align-items:start; }
+  @media (max-width:900px){ .lutw{grid-template-columns:1fr;} }
+  .lutw table td:first-child { color:var(--dim); white-space:nowrap; }
+  .lutw table td:last-child { font-family:ui-monospace,monospace; font-size:.85rem; }
+  .lutw input[type=number], .lutw input[type=range] { width:100%; }
+  .lutw input[type=number] { background:#0b0d12; color:var(--fg); border:1px solid #3a4150; border-radius:6px; padding:5px 8px; font-family:ui-monospace,monospace; }
+  .lutw canvas { width:100%; height:auto; background:#0b0d12; border:1px solid #2a2f3a; border-radius:8px; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
+  .chips button { padding:3px 10px; font-size:.8rem; }
+  .stack { display:flex; height:26px; border-radius:5px; overflow:hidden; margin:4px 0; }
+  .stack div { display:flex; align-items:center; justify-content:center; font-size:.72rem; color:#111; white-space:nowrap; overflow:hidden; }
+  .stk-t { background:#ff9b9b; } .stk-f { background:#8de8a0; } .stk-b { background:#c9c9c9; }
+  .bitrow { font-family:ui-monospace,monospace; font-size:.95rem; letter-spacing:.5px; }
+  .bit-s { color:#9aa3b2; } .bit-e { color:#ffcb6b; } .bit-m { color:#6ea8fe; } .bit-z { color:#555; }
+</style>
+</head>
+<body>
+<nav class="tabs">
+  <button data-page="fp8" class="on">1 &middot; Ping-pong idea &mdash; FlyDSL FP8 FMHA</button>
+  <button data-page="hstu">2 &middot; Ping-pong in practice &mdash; HSTU backward</button>
+  <button data-page="fwd">3 &middot; HSTU forward &mdash; sigma lookup-table gate</button>
+  <button data-page="spmla">4 &middot; Sparse MLA &mdash; ping-pong on a gather-bound kernel</button>
+</nav>
+<main>
+
+<section class="page on" id="page-fp8">
+<h1>Ping-pong scheduling for attention</h1>
+<div class="sub">Worked example: the FlyDSL FP8 flash-attention kernel for gfx950 (MI355X / CDNA4).
+Code: <a href="https://github.com/AMD-AGI/diffusion-models-inference-private/tree/zhuo/mha_flydsl/flydsl">AMD-AGI/diffusion-models-inference-private, branch <code>zhuo/mha_flydsl</code>, <code>flydsl/</code></a>
+(the file names below refer to that directory).</div>
+
+<!-- ============================================================ -->
+<h2>1. The problem ping-pong solves</h2>
+<div class="card">
+<p>Attention per KV tile is two GEMMs with a softmax in between:</p>
+<pre>S = Q &middot; K<sup>T</sup>        <span class="c"># MFMA  (matrix core)</span>
+P = softmax(S)       <span class="c"># VALU / transcendental (vector ALU)</span>
+O += P &middot; V         <span class="c"># MFMA</span></pre>
+<p>Within one wave these are data-dependent, so a single wave alternates: matrix core busy, then VALU busy, then matrix core again.
+Each unit idles while the other runs. On CDNA a SIMD has <em>separate</em> issue paths for MFMA and VALU, so if two waves on the
+same SIMD are in <em>opposite</em> phases, the MFMA of one overlaps the softmax of the other.</p>
+<p><b>Ping-pong</b> = deliberately skew two wave groups by half an iteration and use <code>s_barrier</code> to keep them locked in that skew,
+so on every SIMD one wave is always in its MFMA burst while its partner is in its softmax.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. The schedule (paper Figure 1)</h2>
+<figure>
+  <img src="fig1_pingpong.png" alt="Ping-pong schedule: 8 wavefronts on 4 SIMDs, two per SIMD, offset by one phase">
+  <figcaption>
+    Figure 1 of <a href="https://arxiv.org/pdf/2611.09225">arXiv 2611.09225</a>: 8 wavefronts on 4 SIMDs.
+    <span class="tag t-m">red</span> = MFMA phase, <span class="tag t-v">green</span> = softmax (VALU) phase, dashed lines = <code>s_barrier</code>.
+    Wavefronts 0&ndash;3 start with <code>S&#8320;=Q&middot;K&#8320;</code>; wavefronts 4&ndash;7 start one phase later, so in every column each SIMD has one red and one green.
+  </figcaption>
+</figure>
+
+<div class="card">
+<h3>How to read it</h3>
+<ul>
+  <li><b>Rows</b>: each SIMD hosts two wavefronts (0&amp;4, 1&amp;5, 2&amp;6, 3&amp;7). Same SIMD, same matrix core, same VALU &mdash; this is the contended resource being time-shared.</li>
+  <li><b>Columns</b>: the dashed <code>s_barrier</code>s are phase boundaries. Between two barriers the wave runs exactly one thing: an MFMA burst or a softmax.</li>
+  <li><b>Skew</b>: the second group does nothing but wait for the first group's <code>S&#8320;</code> in the first phase, then runs one phase behind forever.
+      Steady state, every barrier interval has (group A in MFMA, group B in softmax) or the reverse.</li>
+  <li><b>Hand-off</b>: when A finishes its MFMA burst it has produced S; it hits the barrier and starts softmax, and B (which just finished softmax) starts its MFMA burst using the P it produced.</li>
+</ul>
+</div>
+
+<h3>Interactive: step through it</h3>
+<div class="card">
+  <div class="tl" id="tl"></div>
+  <div class="ctl">
+    <button id="prev">&#9664; prev</button>
+    <button id="play">&#9654; play</button>
+    <button id="next">next &#9654;</button>
+    <span style="color:var(--dim)">phase <b id="ph">0</b></span>
+  </div>
+  <div id="tlnote"></div>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. How the FP8 kernel realises it</h2>
+
+<table>
+<tr><th>Knob</th><th>Value</th><th>Where</th></tr>
+<tr><td>Workgroup</td><td>8 waves (512 threads), <code>BLOCK_M=256</code> query rows &rArr; 32 rows/wave</td><td><code>traits.py</code></td></tr>
+<tr><td>Wave groups</td><td><b>g0</b> = waves 0&ndash;3, <b>g1</b> = waves 4&ndash;7 (<code>is_g0 = wave_id &lt; NUM_WAVES//2</code>). One of each per SIMD.</td><td><code>fp8.py</code></td></tr>
+<tr><td>KV tile</td><td><code>BLOCK_N=128</code>, <code>head_dim=128</code>, FP8 32x32x64 MFMA (needs gfx95x)</td><td><code>traits.py</code></td></tr>
+<tr><td>LDS</td><td>2 K slots + 2 V slots (<code>NUM_BUF_K = NUM_BUF_V = 2</code>), one LDS global each so the backend can prove they don't alias</td><td><code>fp8.py</code> <code>SharedStorage</code></td></tr>
+<tr><td>Loads</td><td>Direct-to-LDS DMA. <b>g0 streams K</b> (issued inside its QK burst), <b>g1 streams V</b>. Each group only fills the tile the other needs next.</td><td><code>pipeline.py</code> <code>k_dma_passes</code> / <code>v_dma_passes</code></td></tr>
+<tr><td>Priorities</td><td><code>s_setprio(1)</code> during the MFMA burst, <code>s_setprio(0)</code> during softmax, so the MFMA wave wins the shared issue slot</td><td><code>MFMA_PRIO=1</code>, <code>SOFTMAX_PRIO=0</code></td></tr>
+<tr><td>Unroll</td><td><code>UNROLL=4</code> (multiple of both buffer counts &rArr; every LDS slot in the body is a compile-time constant)</td><td><code>traits.py</code></td></tr>
+<tr><td>Softmax</td><td>VALU-only by design: max frozen on tile 0, Schraudolph exp2, fp8 pack; the L denominator is a "ones column" folded into the <em>next</em> MFMA burst; a watchdog + <code>rollback</code> repairs rare tiles that exceed the frozen max</td><td><code>op_softmax.py</code></td></tr>
+</table>
+
+<h3>The loop body, per group</h3>
+<div class="row">
+<div>
+<b>g0 &mdash; MFMA first</b>
+<pre><span class="c"># g0_step</span>
+ut.wait_vmcnt()
+<span class="h">ut.phase_barrier()</span>          <span class="c"># &#9312; enter MFMA phase</span>
+ut.set_wave_priority(MFMA_PRIO)
+o, l = self.pv(...)           <span class="c"># O += P_i . V_i</span>
+s    = self.qk(..., dma=K)    <span class="c"># S_{i+1} = Q . K_{i+1}</span>
+                              <span class="c">#   + K DMA for tile i+2</span>
+ut.sched_barrier()
+ut.set_wave_priority(SOFTMAX_PRIO)
+<span class="h">ut.phase_barrier()</span>          <span class="c"># &#9313; enter softmax phase</span>
+m, p, l, o, l = self.softmax(s, ...)</pre>
+</div>
+<div>
+<b>g1 &mdash; softmax first</b>
+<pre><span class="c"># g1_step</span>
+m, p, l, o, l = self.softmax(s, ...)
+                              <span class="c"># VALU, overlaps g0's MFMA</span>
+ut.wait_vmcnt()
+<span class="h">ut.phase_barrier()</span>          <span class="c"># &#9312; enter MFMA phase</span>
+ut.set_wave_priority(MFMA_PRIO)
+o, l = self.pv(...)
+s    = self.qk(..., dma=V)    <span class="c"># V DMA issued here</span>
+ut.sched_barrier()
+ut.set_wave_priority(SOFTMAX_PRIO)
+<span class="h">ut.phase_barrier()</span>          <span class="c"># &#9313;</span></pre>
+</div>
+</div>
+<p>Both bodies contain the <em>same two barriers</em>; g1 just starts its iteration at the softmax instead of the MFMA burst. Because <code>s_barrier</code>
+is workgroup-wide, g0 and g1 hit the same barrier instance with opposite work on either side &mdash; that is the whole mechanism. The skew is established in the prologue:
+g0 does <code>QK&#8320;</code> then a <code>phase_barrier()</code> before softmax; g1's <code>iter0</code> has the matching barrier up front (see the "pairs with the barrier in ..." comments in <code>pipeline.py</code>).</p>
+
+<div class="card">
+<h3>Details that make it actually work</h3>
+<ul>
+  <li><b><code>phase_barrier()</code> = <code>sched_barrier(0); s_barrier; sched_barrier(0)</code></b>. Without the fences the machine scheduler sinks VALU into the next MFMA phase and the skew collapses (half of g0's softmax migrated in one experiment, per the docstring in <code>utils.py</code>). It also avoids <code>gpu.barrier</code>'s implicit <code>lgkmcnt(0)</code>; waits are placed by hand.</li>
+  <li><b>Priority is the arbiter</b>: both waves on a SIMD are ready to issue; <code>s_setprio</code> decides that the MFMA wave wins, so the matrix core never starves while the softmax wave fills VALU gaps.</li>
+  <li><b>MFMA bursts chain without a drain</b>: each burst's tail reads the next burst's first operands from LDS (<code>PREFETCH_DEPTH=2</code>: the MFMA at unit <i>u</i> uses operands read two MFMAs ago, hiding one <code>ds_read</code> latency).</li>
+  <li><b>Cross-group buffer hazards</b> are resolved by the phase alternation itself (g0 and g1 are never in the same phase), except iteration 0 which has no leading barrier &mdash; hence the explicit extra barrier there.</li>
+  <li><b>Softmax is moved off the critical path</b>: the softmax scale rides in the QK MFMA's e8m0 operand, the L reduction runs on the matrix core ("ones column"), so the VALU phase is just max / exp2 / pack and fits inside the partner's MFMA burst.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. What it looks like on hardware (WaveScope trace)</h2>
+<figure class="dark">
+  <img src="flydsl_fp8_pingpong_trace.png" alt="WaveScope ATT trace of the FlyDSL FP8 ping-pong kernel: 8 resident waves on SE0, SM0-SM3 x W0/W1">
+  <figcaption>
+    WaveScope trace of one steady-state dispatch (~3.3k cycles shown), 8 resident waves = 4 SIMDs (SM0&ndash;SM3) &times; 2 waves (W0, W1).
+    Colour is instruction class (MFMA dark green, VALU, LDS/STORE orange, VMEM yellow, ...); grey blocks are WAIT (barrier / dependency waits).
+  </figcaption>
+</figure>
+
+<div class="card">
+<h3>What to look for</h3>
+<ul>
+  <li><b>All four SIMDs look the same</b>, i.e. the skew is uniform across the workgroup.</li>
+  <li><b>W0 and W1 on one SIMD have complementary texture.</b> Where W0 shows a long, dense MFMA run, W1 shows a fragmented region (short VALU/LDS-heavy segments); a few cycles later they swap. That is Figure 1's red/green alternation, measured.</li>
+  <li><b>Grey WAIT gaps line up with the barriers.</b> A wave that finished its phase early sits in <code>s_barrier</code> until its partner group arrives; the length of those gaps tells you which phase is the longer one and therefore which unit is the bottleneck.</li>
+  <li><b>Ideal result</b>: the MFMA lane is never idle on any SIMD. Any visible gap in the busy wave's MFMA stream is time ping-pong failed to hide: either the softmax phase is longer than the MFMA phase (VALU-bound), or a wait on <code>ds_read</code>/<code>vmcnt</code> leaked into the burst.</li>
+</ul>
+<p style="color:var(--dim)">Tip: a long Stall on an instruction is an <em>issue</em> stall, not necessarily latency &mdash; read the gating <code>s_waitcnt</code> first.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Summary</h2>
+<div class="card">
+<ol>
+  <li>Split the 8 waves into two groups so each SIMD hosts one wave of each.</li>
+  <li>Skew the groups by one phase (prologue barrier), then run the <em>same</em> two-barrier loop body.</li>
+  <li>Barriers keep the skew; <code>sched_barrier</code> fences keep the compiler from undoing it; <code>s_setprio</code> lets the MFMA wave win issue.</li>
+  <li>Make the softmax VALU-only and the MFMA bursts self-chaining (prefetch, DMA from the partner phase) so neither phase stalls on memory.</li>
+  <li>Verify with a trace: complementary W0/W1 texture, MFMA lane saturated, barrier waits short.</li>
+</ol>
+</div>
+
+</section><!-- /page-fp8 -->
+
+<!-- ===================================================================== -->
+<!-- ======================= PAGE 2: HSTU BACKWARD ======================= -->
+<!-- ===================================================================== -->
+<section class="page" id="page-hstu">
+
+<h1>Ping-pong on the HSTU backward pass</h1>
+<div class="sub">HSTU (Hierarchical Sequential Transduction Unit, Meta's attention for generative recommenders): from two ping-pong kernels (dV/dK and dQ) to one fused kernel + split-K reduction &mdash; MI300X (gfx942), bf16, production shape
+B=1024, H=4, N=16384, d=64, hstu mask, 300 targets.
+Code: <a href="https://github.com/ROCm/aiter/pull/6175">ROCm/aiter PR #6175</a> (<code>aiter/ops/flydsl/kernels/hstu/</code>)</div>
+
+<div class="note">Intermediate numbers are A/B measurements taken during development, each against a same-day baseline, so absolute ms drift by a few percent between rows; compare ratios.
+The final per-kernel numbers and the fused-vs-split / CK / H100 comparison were measured separately on another MI300X node.</div>
+
+<!-- ============================================================ -->
+<h2>1. The math</h2>
+
+<div class="card">
+<p>HSTU attention replaces softmax with a pointwise SiLU gate. <b>There is no row normalisation</b>, so every row is independent and the backward needs no
+row statistics (no <code>lse</code>, no row sums) &mdash; simpler than FlashAttention's backward.</p>
+<h3>Forward</h3>
+<div class="eq">
+  Z = &alpha; &middot; Q K<sup>T</sup> &nbsp;&nbsp;&nbsp; [L&times;L] scores<br>
+  A = M &odot; silu(Z) / N &nbsp;&nbsp;&nbsp; M = causal / window / target mask, N = max_seq_len (constant)<br>
+  O = A V
+</div>
+<div class="eq">
+  silu(z) = z &middot; &sigma;(z) &nbsp;&nbsp;&nbsp;&nbsp; silu&prime;(z) = &sigma;(z) &middot; (1 + z &middot; (1 &minus; &sigma;(z))) &nbsp;&nbsp;&nbsp;&nbsp; &sigma;(z) = 1 / (1 + e<sup>&minus;z</sup>)
+</div>
+<p>One shared sigmoid gives both the value and the derivative: this is the "gate", and it is the only VALU/transcendental work in the kernel
+(<code>v_exp_f32</code> + <code>v_rcp_f32</code> per score element).</p>
+
+<h3>Backward (given dO)</h3>
+<div class="eq">
+  P &nbsp;= M &odot; silu(Z) <span class="n">gate value (forward's A without 1/N)</span><br>
+  dV = (1/N) &middot; P<sup>T</sup> dO <span class="n">GEMM1</span><br>
+  dA = dO V<sup>T</sup> <span class="n">GEMM2</span><br>
+  dS = M &odot; silu&prime;(Z) &odot; dA <span class="n">gate derivative; 1/N deferred</span><br>
+  dK = (&alpha;/N) &middot; dS<sup>T</sup> Q <span class="n">GEMM3</span><br>
+  dQ = (&alpha;/N) &middot; dS K <span class="n">GEMM (dq kernel)</span>
+</div>
+<p>Per (Q-tile, KV-tile) pair this is <b>five</b> GEMMs and one gate, with <code>S = QK<sup>T</sup></code> and <code>dA</code> both feeding the gate:</p>
+<pre>  S  = Q K<sup>T</sup>   (GEMM0) ──┐
+                           ├──▶ gate (VALU: exp2, rcp, mask) ──▶ P, silu'(Z)
+  dA = dO V<sup>T</sup>  (GEMM2) ──┘                                     │
+                                                                     ▼
+  dV += P<sup>T</sup> dO   (GEMM1) &lt;── P                    dS = silu'(Z) &middot; dA &middot; mask
+  dK += dS<sup>T</sup> Q   (GEMM3) &lt;── dS                   dQ += dS K     (GEMM4)</pre>
+<p><b>P and dS are never written to memory.</b> They are MFMA accumulator fragments, gated in registers, repacked to bf16, and fed straight back in as MFMA operands.
+On CDNA an accumulator fragment reinterpreted as an <em>A</em> operand reads as its transpose, so the Pᵀ / dSᵀ the chained GEMMs need cost nothing &mdash; no shuffle, no LDS round-trip.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Two kernels, two ownerships</h2>
+<p>Rows of the L&times;L matrix are queries, columns are keys; causality means query <i>q</i> only sees keys &le; <i>q</i> (lower triangle). dV/dK reduce over queries, dQ reduces over keys, so they want opposite ownership.</p>
+
+<figure>
+<svg viewBox="0 0 820 330" width="100%" role="img" aria-label="Ownership: dvdk is KV-owned, dq is Q-owned">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ffcb6b"/></marker>
+  </defs>
+  <!-- panel 1 -->
+  <g transform="translate(50,50)">
+    <text x="100" y="-28" text-anchor="middle" font-size="16" font-weight="600">dvdk: KV-owned</text>
+    <text x="100" y="-10" text-anchor="middle" font-size="12" fill="#9aa3b2" style="fill:#9aa3b2">WG owns a KV slice, streams Q / dO tiles</text>
+    <polygon points="0,0 0,200 200,200" fill="#1d212b" stroke="#4a5163"/>
+    <polygon points="60,60 90,90 90,200 60,200" fill="#6ea8fe" fill-opacity=".55" stroke="#6ea8fe"/>
+    <g stroke="#ffcb6b" stroke-width="1.5" fill="none">
+      <rect x="60" y="100" width="30" height="14"/><rect x="60" y="130" width="30" height="14"/><rect x="60" y="160" width="30" height="14"/>
+    </g>
+    <path d="M110,92 L110,196" stroke="#ffcb6b" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="118" y="150" font-size="12" style="fill:#ffcb6b">stream Q,dO</text>
+    <text x="75" y="213" text-anchor="middle" font-size="12">KV slice</text>
+    <text x="-8" y="105" text-anchor="end" font-size="12">q</text>
+    <text x="100" y="228" text-anchor="middle" font-size="12" style="fill:#9aa3b2">kv &rarr;</text>
+    <text x="100" y="250" text-anchor="middle" font-size="12">resident: K, V, dV-acc, dK-acc</text>
+    <text x="100" y="266" text-anchor="middle" font-size="12" style="fill:#8de8a0">output rows: single-writer, plain stores</text>
+  </g>
+  <!-- panel 2 -->
+  <g transform="translate(450,50)">
+    <text x="100" y="-28" text-anchor="middle" font-size="16" font-weight="600">dq: Q-owned</text>
+    <text x="100" y="-10" text-anchor="middle" font-size="12" style="fill:#9aa3b2">WG owns a Q slice, streams K / V tiles</text>
+    <polygon points="0,0 0,200 200,200" fill="#1d212b" stroke="#4a5163"/>
+    <polygon points="0,110 110,110 140,140 0,140" fill="#8de8a0" fill-opacity=".55" stroke="#8de8a0"/>
+    <g stroke="#ffcb6b" stroke-width="1.5" fill="none">
+      <rect x="10" y="110" width="14" height="30"/><rect x="40" y="110" width="14" height="30"/><rect x="70" y="110" width="14" height="30"/>
+    </g>
+    <path d="M4,160 L108,160" stroke="#ffcb6b" stroke-width="2" marker-end="url(#ar)"/>
+    <text x="30" y="178" font-size="12" style="fill:#ffcb6b">stream K,V</text>
+    <text x="-8" y="128" text-anchor="end" font-size="12">Q slice</text>
+    <text x="100" y="228" text-anchor="middle" font-size="12" style="fill:#9aa3b2">kv &rarr;</text>
+    <text x="100" y="250" text-anchor="middle" font-size="12">resident: Q, dO, dQ-acc</text>
+    <text x="100" y="266" text-anchor="middle" font-size="12" style="fill:#8de8a0">output rows: single-writer, plain stores</text>
+  </g>
+</svg>
+<figcaption>Lower triangle = causal mask. Blue strip: the KV rows one dvdk workgroup owns and the Q/dO tiles it sweeps. Green strip: the Q rows one dq workgroup owns and the K/V tiles it sweeps.</figcaption>
+</figure>
+
+<table>
+<tr><th></th><th>dvdk (<code>hstu_attention_bwd.py</code>)</th><th>dq (<code>hstu_attention_bwd_dq.py</code>)</th></tr>
+<tr><td>Produces</td><td>dV, dK</td><td>dQ</td></tr>
+<tr><td>Owned (resident in regs)</td><td>K, V + dV-acc + dK-acc &mdash; ~288 VGPR at d=128</td><td>Q, dO + dQ-acc &mdash; ~128 VGPR at d=64</td></tr>
+<tr><td>Streamed (via LDS)</td><td>Q, dO, plus transposed copies Qᵀ, dOᵀ for the B operands</td><td>K, V &mdash; no transpose tiles</td></tr>
+<tr><td>GEMMs / tile</td><td>4 (S, dA, dV, dK)</td><td>3 (Sᵀ, dAᵀ, dQ)</td></tr>
+<tr><td>Gate</td><td>silu <b>and</b> silu&prime; (needs P)</td><td>silu&prime; only</td></tr>
+<tr><td>Layout trick</td><td>S = Q&middot;Kᵀ; reinterpret accumulator &rarr; Pᵀ, dSᵀ</td><td>computes <b>Sᵀ = K&middot;Qᵀ on purpose</b> so the accumulator reinterprets into dS (A operand of dQ = dS&middot;K)</td></tr>
+<tr><td>Cross-WG reduction</td><td>none</td><td>none</td></tr>
+</table>
+<p>Both kernels compute <code>S</code>, <code>dA</code> and the whole gate. That duplicated work is what step 2 removes.</p>
+
+<!-- ============================================================ -->
+<h2>3. The baseline and why it leaves performance on the table</h2>
+
+<div class="card">
+<p>Shipping configs (B=1024 H=4 N=16384 d=64 hstu t=300): dvdk tuned <code>(192,16,4)</code> = <b>305.7 ms</b>, dq tuned <code>(128,32,2,2)</code> = <b>228.0 ms</b>, full backward <b>530.4 ms</b>.</p>
+<p>Each SIMD hosts two co-resident waves (from two workgroups, or 2 waves of one). They are in <em>lockstep</em> on the shared barrier: they idle together and burst MFMA together,
+contending for one matrix core. Measured for dvdk: <b>27.9% matrix-core busy, 50.7% of all stall in <code>s_waitcnt</code></b>.</p>
+</div>
+
+<figure class="slotfig"><img src="ori_dvdk.png" alt="Original dvdk WaveScope trace" loading="lazy">
+<figcaption><b>Original dvdk</b>, one SIMD (W0 and W1 are its two resident waves). Each wave runs the dependency chain <b>LDS &rarr; VALU (gate) &rarr; Barrier &rarr; MFMA</b>, and the MFMA is only a short burst at the end of it.
+The two waves are in lockstep on the shared barrier, so they idle (grey WAIT) together and burst together: the matrix core is busy only a fraction of the time.</figcaption></figure>
+<figure class="slotfig"><img src="ori_dq.png" alt="Original dq WaveScope trace" loading="lazy">
+<figcaption><b>Original dq</b>, same chain (VALU &rarr; Barrier &rarr; MFMA &rarr; LDS) and the same behaviour: long barrier waits, short MFMA bursts, nothing from the partner wave to fill the gaps.</figcaption></figure>
+
+<!-- ============================================================ -->
+<h2>4. Step 1 &mdash; ping-pong each kernel separately</h2>
+
+<div class="card">
+<p>Apply the page-1 recipe: 8 waves in <b>one</b> workgroup, two groups (g0 = waves 0&ndash;3, g1 = waves 4&ndash;7), one of each per SIMD, held half an iteration apart by <code>s_barrier</code>.
+Each barrier interval is one of two phases:</p>
+<ul>
+  <li><b>Phase M</b> (matrix): the 48-MFMA burst, its LDS operand feed, the Q/dO DMA, the transpose build, the mask.</li>
+  <li><b>Phase V</b> (vector): the fused SiLU / SiLU&prime; gate. <b>No memory operations at all.</b></li>
+</ul>
+<p>While g0 is in M, g1 is in V, and vice versa &mdash; the matrix core and the VALU pipe are busy simultaneously.</p>
+
+<div class="tl" style="margin-top:12px">
+  <div class="lane"><div class="nm">g0 (waves 0&ndash;3)</div><div class="cells">
+    <div class="cell m">M(i)</div><div class="cell v">V(i)</div><div class="cell m">M(i+1)</div><div class="cell v">V(i+1)</div><div class="cell m">M(i+2)</div></div></div>
+  <div class="lane"><div class="nm">g1 (waves 4&ndash;7)</div><div class="cells">
+    <div class="cell v">V(i&minus;1)</div><div class="cell m">M(i)</div><div class="cell v">V(i)</div><div class="cell m">M(i+1)</div><div class="cell v">V(i+1)</div></div></div>
+  <div class="barline"><div>s_barrier</div><div>s_barrier</div><div>s_barrier</div><div>s_barrier</div><div>s_barrier</div></div>
+</div>
+
+<h3>Structural points (each load-bearing)</h3>
+<ul>
+  <li><b>Chained GEMMs consume the <em>previous</em> tile's fragments.</b> GEMM1/GEMM3 at trip <i>i</i> use P[i&minus;1], dS[i&minus;1], so GEMM0/2 of tile <i>i</i> and GEMM1/3 of tile <i>i&minus;1</i> form one contiguous MFMA burst. Zero-seeding the packs makes trip 0 self-starting and the extra trip the drain &mdash; no peeled iteration.</li>
+  <li><b>Work split between groups:</b> g0 stages Q and builds Qᵀ, g1 stages dO and builds dOᵀ; both run all four GEMMs on their own disjoint KV rows, so no cross-wave reduction.</li>
+  <li><b>Transpose build lives in phase M, not V.</b> A tile written in one group's V phase is published at the next barrier, but the partner's consuming M phase overlaps that very V phase: an unsynchronised cross-group RAW race. Building in M puts one barrier between write and earliest partner read.</li>
+  <li><b>Row-major Q/dO are 3-deep, fired two tiles ahead.</b> At depth 2 the load only gets the tail of one M phase, which brings back the <code>vmcnt</code> stall the kernel exists to remove.</li>
+  <li><b>Prologue skew must come <em>before</em> the DMA fence</b>: each group stages only its own tensor but trip 0 reads both, so the publish fence has to be the last thing either group does. Wrong order was invisible at the tuned 384 shape (0/63 runs) and nondeterministic at 256 (36/63).</li>
+</ul>
+</div>
+
+<h3>The first ping-pong version: repaying the 8-wave entry fee</h3>
+
+<figure class="slotfig dark"><img src="pp_hstu_dvdk_first.png" alt="WaveScope trace of the first dvdk ping-pong" loading="lazy">
+<figcaption><b>dvdk, first ping-pong version</b> (8 resident waves = 4 SIMDs &times; W0/W1, ~4.8k cy shown). The skew is already there: around 165.9k cycles the two waves of every SIMD swap roles. Before that W0 shows several grey WAIT blocks while W1 is a long solid green run; after it the pattern reverses.
+The grey WAIT blocks are barrier waits: the interval is <code>max(M, V)</code>, and in this version the gate phase V was the longer one (2232 cy vs 2012 cy for M), so the other wave waits on it. That is what the tricks below remove.</figcaption></figure>
+
+<table>
+<tr><th>kernel</th><th>original (shipping tuned)</th><th>ping-pong, first version</th><th>H100 CUTLASS target</th></tr>
+<tr><td>dvdk</td><td>305.7 ms &nbsp;(192,16,4)</td><td>293.3 ms (&minus;4.1%) &nbsp;(384,16,8)</td><td class="neu">n/a (CUTLASS runs one backward kernel)</td></tr>
+<tr><td>dq</td><td>228.0 ms &nbsp;(128,32,2,2)</td><td>209.3 ms (&minus;8.2%) &nbsp;(512,16,8,2)</td><td class="neu">n/a</td></tr>
+<tr><td><b>dvdk + dq</b></td><td>533.7 ms</td><td>502.6 ms (&minus;5.8%)</td><td><b>384.4 ms</b><br><span class="neu" style="font-size:.8rem">original is 1.39x of it, first ping-pong 1.31x</span></td></tr>
+</table>
+<p class="neu">B=1024, H=4, N=16384, d=64, hstu t=300, MI300X; each kernel timed alone. H100 target: <code>cuda_hstu_mha_autograd</code> (CUTLASS) full backward, B=1024, H=4, hstu mask, 300 targets, measured on an H100 80 GB; a different machine, so indicative only.</p>
+<p><b>The entry fee in numbers</b> (the same kernels at the ping-pong geometry, before any skew): dvdk 305.7 &rarr; <b>353.7 ms (+15.5%)</b>, dq 228.0 &rarr; <b>265.4 ms (+16.7%)</b>. The first ping-pong versions above (293.3 and 209.3 ms) are what is left after the skew has repaid that fee and more.<br>Going to one workgroup per CU removes the co-resident workgroups that were covering each other's barrier / <code>waitcnt</code> stalls (~60% of dvdk stall was there).
+Ping-pong has to repay this before it shows any win; 8 waves per WG is forced, since two waves per SIMD inside one barrier domain is the only way to hold them in opposite phases. Shrinking BLOCK_M to compensate is far worse (256 = +30%, 128 = +62% for dvdk): <b>reuse beats residency</b>.</p>
+
+<!-- ---------- tricks ---------- -->
+<h3>The tricks that took dvdk from 293 to ~213 ms</h3>
+
+<div class="card">
+<p><b>The narrative:</b> the barrier interval is <code>max(M, V)</code>, so only the longer phase matters. At first that was <b>V</b> (gate 2232 cy vs M 2012 cy), so the first work is cutting VALU.
+Then it turned out the gate was <em>latency-bound</em> (a chain of dependent transcendentals), where fewer instructions does <em>not</em> help and "obvious" packing hurts.
+Once the chains were broken it became <em>instruction-bound</em> (1808 cy with only 249 cy stall against 1045 cy of pipe work) and op-count mattered again.</p>
+</div>
+
+<table class="tricks">
+<tr><th>group</th><th>what was done</th><th>rough effect on kernel time</th></tr>
+<tr><td>Schedule</td><td>Port the FP8 ping-pong skeleton (page 1); chain the GEMMs so tile <i>i</i>'s S/dA GEMMs and tile <i>i&minus;1</i>'s dV/dK GEMMs form one MFMA burst; zero-seeded packs instead of a peeled iteration; take the prologue skew before the DMA publish fence.</td><td class="pos">305.7 &rarr; 293 ms</td></tr>
+<tr><td>Gate: fewer VALU ops</td><td>Algebra and constant folding: fold &alpha; (and &minus;log<sub>2</sub>e) into K once in the prologue so the MFMA emits the scaled score; defer 1/N to the epilogue; rewrite silu&prime; to share terms with silu; compare indices directly for the mask; bf16 pack as a byte select (<code>v_perm_b32</code>) since truncation is exact.</td><td class="pos">~9%</td></tr>
+<tr><td>Gate: break dependency chains</td><td><b>The biggest lever.</b> Keep the gate off the packed-FP32 datapath: a packed op is a <em>join</em> that waits for both halves' producers (here two quarter-rate <code>v_exp_f32</code>), so it serialises independent chains. Pin the critical ops to scalar shapes (inline asm / legacy multiply intrinsics) so the compiler cannot re-fuse them; end with zero <code>v_pk_*</code> in the loop.</td><td class="pos">~14%</td></tr>
+<tr><td>MFMA burst / LDS feed</td><td>Issue all operand reads up front so the burst tail is one descending <code>lgkmcnt</code> drain; interleave independent GEMM pairs to double the spacing on each accumulate chain; lay out the transposed tiles so each lane's operands are one contiguous run (<code>ds_read_b128</code>); swizzle LDS tiles whose row stride hits the bank period.</td><td class="pos">~3%</td></tr>
+<tr><td>Correctness under the skew</td><td>Ping-pong exposed ordering bugs the lockstep kernel hid: publish-before-fence in the prologue, out-of-range DMA leaving LDS <em>unwritten</em> (stale NaN &times; masked 0), ring buffers indexed by value instead of by step. Each was caught with NaN poisoning and bitwise A/B against a twin kernel.</td><td>a few % paid for correctness</td></tr>
+<tr><td>Tried and rejected</td><td>Moving the mask into phase M (VGPR cap), inverting <code>s_setprio</code>, pinning reciprocals with <code>sched_barrier</code>, GEMM orders other than pairwise, swizzling a tile whose XOR address math landed in the VALU-bound phase.</td><td class="neg">neutral or slower</td></tr>
+</table>
+
+<p><b>Common thread.</b> A ping-pong phase is a tight latency problem, not a throughput one: pin instruction shapes so the scheduler can't re-fuse them (inline asm, <code>fmul.legacy</code>, <code>sched_group_barrier</code>),
+judge every change by A/B latency (not ISA counts: a passing accuracy run doesn't prove a timing hazard is covered), and expect the hazard recognizer to be blind inside inline asm (you add your own <code>s_nop</code>).</p>
+
+<h3>Result of the tricks: optimised dvdk and dq ping-pong</h3>
+<figure class="slotfig"><img src="pp_dvdk_kernel.png" alt="WaveScope trace of dvdk ping-pong" loading="lazy">
+<figcaption><b>dvdk ping-pong, after the tricks</b>, steady state (~7.3k cy shown, 8 resident waves = 4 SIMDs &times; W0/W1). On each SIMD the two waves are half a period apart:
+where W0 shows the grey WAIT gap and orange LDS/STORE burst (the M phase's Q/dO DMA, transpose build and operand feed), W1 is a dense green MFMA/VALU run, then they swap.
+All four SIMDs look the same, so the skew is uniform across the workgroup. Compare with the first version above and with the lockstep original in &sect;3.</figcaption></figure>
+<figure class="slotfig"><img src="pp_dq_kernel.png" alt="WaveScope trace of dq ping-pong" loading="lazy">
+<figcaption><b>dq ping-pong</b> (~9.2k cy shown). The alternation is the clearest here: W0's long grey WAIT blocks (barrier waits) at ~239k and ~242.5k fall exactly where W1 is running solid green,
+and W1's own WAIT blocks at ~240.6k and ~244k fall where W0 is busy. The orange LDS/STORE bursts (K/V staging) also alternate between the two groups.</figcaption></figure>
+
+<table>
+<tr><th>Per kernel (ms)</th><th>original</th><th>ping-pong, first version</th><th>ping-pong, optimised</th><th>speed-up (optimised vs original)</th><th>H100 CUTLASS target</th></tr>
+<tr><td>dvdk</td><td>305.7</td><td>293.3</td><td class="pos"><b>213</b></td><td class="pos">1.43x</td><td class="neu">n/a</td></tr>
+<tr><td>dq</td><td>228.0</td><td>209.3</td><td class="pos"><b>206</b></td><td class="pos">1.11x</td><td class="neu">n/a</td></tr>
+<tr><td><b>dvdk + dq</b></td><td>533.7</td><td>502.6</td><td class="pos"><b>419</b></td><td class="pos"><b>1.27x</b></td><td><b>384.4</b><br><span class="neu" style="font-size:.8rem">original 1.39x of it, optimised pp 1.09x</span></td></tr>
+</table>
+<p class="neu">The remaining gap to the H100 target (419 vs 384.4 ms) is what the fusion step goes after.</p>
+<p class="neu">Observation from the two traces: the ping-pong dvdk gain (1.43x) is much larger than dq's (1.11x). A plausible (unmeasured) reason: dq starts from a lighter kernel (128 resident VGPR vs ~288 for dvdk, no transpose tiles), so there was less stall to hide.</p>
+
+<!-- ============================================================ -->
+<h2>5. Step 2 &mdash; fuse dV/dK/dQ into one kernel</h2>
+
+<div class="card">
+<p><b>Observation.</b> After step 1 the backward is two ping-pong kernels that each recompute <code>S = QKᵀ</code>, <code>dA = dO Vᵀ</code> and the whole gate. Fusing them removes one pass over Q/K/V/dO and one gate.</p>
+<p><b>Problem.</b> dvdk loops over <em>Q</em> (KV-owned); dQ needs a sum over <em>KV</em> for each query row. Fuse dQ into dvdk and a workgroup only sees its own KV slice, so each workgroup produces a <b>partial dQ</b>
+that has to be summed across all KV-tile workgroups &mdash; a split-K reduction.</p>
+<pre>  KV tile 0 ─ WG0 ─▶ dQ_part[0] ─┐
+  KV tile 1 ─ WG1 ─▶ dQ_part[1] ─┤
+  KV tile 2 ─ WG2 ─▶ dQ_part[2] ─┼─▶ <b>dq_reduce kernel</b> (sum partials, cast to bf16) ─▶ dQ
+      ...                        ┤      reads an fp32 scratch (tens of GB!)
+  KV tile T ─ WGT ─▶ dQ_part[T] ─┘
+  (dV, dK: unchanged, single-writer plain stores)</pre>
+<p>So the fused path = <b>fused kernel + reduce kernel</b>, and the reduction is fully exposed (it has to finish before the next pass overwrites the scratch), i.e. a standing cost to tune.</p>
+</div>
+
+<h3>Why split-K and not atomics</h3>
+<table>
+<tr><th>primitive</th><th>measured</th></tr>
+<tr><td>global fp atomic add</td><td>~0.40 TB/s ceiling (a bytes wall, independent of width / contention)</td></tr>
+<tr><td>plain global store</td><td>3.56 TB/s &mdash; <b>8.8x</b></td></tr>
+<tr><td><code>ds_add_f32</code> for the intra-WG cross-wave sum</td><td>55x a <code>ds_write_b32</code> (737 vs 13 ns/op/wave); fused kernel 1915 ms &rarr; 409 ms after replacing it with per-wave slots summed in phase V</td></tr>
+</table>
+<p>Same lesson at both levels: <b>an fp atomic is a wall &mdash; use disjoint slots and an explicit sum.</b></p>
+
+<h3>Making the fused kernel a ping-pong kernel</h3>
+<p>Same M / V skeleton as the dvdk ping-pong, plus the dQ work, placed so it hides under the partner's phase. The tricks fall into four groups:</p>
+<table class="tricks">
+<tr><th>group</th><th>what was done</th></tr>
+<tr><td>Geometry</td><td>BLOCK_M=256 rather than 384: the larger tile halves the partial-dQ volume but the extra dQ state (~46 VGPR) pushes it into spills, which costs more than the partials save.</td></tr>
+<tr><td>No atomics, no LDS round-trips</td><td>Cross-wave dQ sum through private per-wave LDS slots summed in phase V (instead of <code>ds_add_f32</code>, which alone was 4.7x of the whole kernel); the layout changes dQ = dS&middot;K needs are done <b>in registers with an identity MFMA</b> (feed a B-layout fragment as the A operand, Xᵀ&middot;I = Xᵀ, bit-exact) instead of an LDS write/fence/read.</td></tr>
+<tr><td>Hide the extra work under the partner phase</td><td>Issue the flush reads mid-gate so the VALU covers their latency; keep LDS reads wide (lane-contiguous layout so the backend still emits <code>ds_read_b128</code>); interleave the dQ staging writes with the dQ GEMM via <code>sched_group_barrier</code> (source order alone does not survive the scheduler).</td></tr>
+<tr><td>Trim the burst</td><td>Smaller rolling operand-prefetch window so the reads scatter through the MFMA burst; scalar branches (the group id is wave-uniform) instead of dummy writes to trash rows.</td></tr>
+</table>
+
+<h3>Fused kernel alone &mdash; progression</h3>
+<div class="card bars" id="fusedbars"></div>
+
+<h3>The reduction kernel and the host side</h3>
+<ul>
+  <li><b><code>dq_reduce</code> is bandwidth-bound:</b> vectorised accesses (16 &times; dword &rarr; 4 &times; dwordx4) bought only 0.8% (50.8 &rarr; 50.4 ms, 3.42 TB/s &asymp; 92% of a 3.73 TB/s proxy). Only moving fewer bytes helps, and partial volume is fixed by geometry and the fp32 dtype &mdash; <b>the reduction is the lever</b> that remains.</li>
+  <li><b>kv-chunking into G passes</b> bounds the (otherwise tens-of-GB) scratch; <code>reduce(g)</code> must finish before <code>fused(g+1)</code>. Per-call planning cost cut from 26 ms to 6.8 ms (<code>empty</code> not <code>zeros</code>, no <code>empty_cache()</code> on the fast path).</li>
+  <li><b>Sliding windows</b> supported via a window-aware reduction that reads an element only if the fused pass wrote it (<code>select</code>, not multiply: unwritten slot may hold NaN).</li>
+</ul>
+
+<figure class="slotfig"><img src="fused_kernel.png" alt="WaveScope trace of the fused kernel" loading="lazy">
+<figcaption><b>Fused dV/dK/dQ kernel</b> (~4.5k cy shown). The same half-period skew as the standalone kernels holds with the extra dQ work added. The orange LDS/STORE bursts (dQ staging writes and the cross-wave flush)
+and the grey WAIT blocks move between W0 and W1 on every SIMD, ~half a period apart, with the other wave in a dense MFMA/VALU run. More orange than in the dvdk trace is the price of the dQ partial.</figcaption></figure>
+
+<h3>Result: fused (+ reduce) vs the split dvdk + dq pair</h3>
+<p>Measured on a second MI300X node (bf16, N=16384, d=64; 2026-10-20), both arms in the same run, ms. <b>"split" is the original dvdk + dq pair</b> (the benchmark's <code>split</code> arm is the default dispatch, <code>fused=False</code>; it is <em>not</em> the ping-pong pair, which was opt-in and
+was removed when the fused path shipped). "fused" is the fused kernel + dq_reduce (<a href="https://github.com/ROCm/aiter/pull/6175">PR #6175</a>); CK for reference.
+&ldquo;faster&rdquo; = CK / fused &minus; 1 (resp. CK / split &minus; 1).</p>
+<table>
+<tr><th>mask</th><th>B</th><th>H</th><th>split (original)</th><th>fused</th><th>fused vs split</th><th>CK</th><th>fused faster than CK</th><th>split faster than CK</th></tr>
+<tr><td>causal</td><td>1024</td><td>4</td><td>483.7</td><td>377.9</td><td class="pos">1.28x</td><td>498.1</td><td class="pos">+31.8%</td><td>+3.0%</td></tr>
+<tr><td>causal</td><td>1024</td><td>8</td><td>979.8</td><td>770.8</td><td class="pos">1.27x</td><td>1000.6</td><td class="pos">+29.8%</td><td>+2.1%</td></tr>
+<tr><td>causal</td><td>120</td><td>4</td><td>57.5</td><td>45.0</td><td class="pos">1.28x</td><td>61.7</td><td class="pos">+37.1%</td><td>+7.3%</td></tr>
+<tr><td>causal</td><td>120</td><td>8</td><td>117.6</td><td>89.3</td><td class="pos">1.32x</td><td>120.4</td><td class="pos">+34.9%</td><td>+2.4%</td></tr>
+<tr><td>hstu</td><td>1024</td><td>4</td><td>489.4</td><td>379.4</td><td class="pos">1.29x</td><td>506.1</td><td class="pos">+33.4%</td><td>+3.4%</td></tr>
+<tr><td>hstu</td><td>1024</td><td>8</td><td>989.8</td><td>772.8</td><td class="pos">1.28x</td><td>1017.2</td><td class="pos">+31.6%</td><td>+2.8%</td></tr>
+<tr><td>hstu</td><td>120</td><td>4</td><td>58.5</td><td>45.5</td><td class="pos">1.29x</td><td>63.1</td><td class="pos">+38.6%</td><td>+7.9%</td></tr>
+<tr><td>hstu</td><td>120</td><td>8</td><td>118.1</td><td>89.8</td><td class="pos">1.32x</td><td>122.7</td><td class="pos">+36.7%</td><td>+3.9%</td></tr>
+</table>
+<p class="neu">The &ldquo;fused vs split&rdquo; column is computed from the two columns beside it (1.27&ndash;1.32x). An earlier, independent measurement gave 1.24&ndash;1.32x.</p>
+<div class="card">
+<h3>The whole journey (B=1024, H=4, hstu t300)</h3>
+<table>
+<tr><th>stage</th><th>dvdk</th><th>dq</th><th>total</th><th>where from</th></tr>
+<tr><td>original dvdk + dq</td><td>305.7</td><td>228.0</td><td>533.7</td><td>each kernel timed alone</td></tr>
+<tr><td>ping-pong dvdk + dq (step 1)</td><td class="pos">213</td><td class="pos">206</td><td class="pos">419</td><td>each kernel timed alone (&minus;21.5%)</td></tr>
+<tr><td>fused + reduce (step 2)</td><td colspan="2" style="text-align:center">fused kernel + dq_reduce</td><td class="pos">379.4</td><td>second node (same run: split 489.4 &rarr; fused 379.4, 1.29x)</td></tr>
+</table>
+<p class="neu">Rows come from different machines and harnesses, so compare the ratios, not the absolute ms. On a single machine, the ping-pong split pair was 426.3 ms and the fused path 393.4 ms (&minus;7.7%), i.e. most of the original&rarr;fused gain comes from step 1, and fusion adds a further ~8% on top.</p>
+</div>
+
+<h3>Against H100 CUTLASS</h3>
+<table>
+<tr><th>mask</th><th>B</th><th>H</th><th>H100 CUTLASS</th><th>MI300X fused</th><th>vs H100</th><th>MI300X CK</th><th>CK vs H100</th></tr>
+<tr><td>causal</td><td>1024</td><td>4</td><td>398.7</td><td>377.9</td><td class="pos">+5.5%</td><td>498.1</td><td class="neg">&minus;20%</td></tr>
+<tr><td>hstu</td><td>1024</td><td>4</td><td>384.4</td><td>379.4</td><td class="pos">+1.3%</td><td>506.1</td><td class="neg">&minus;24%</td></tr>
+<tr><td>causal</td><td>1024</td><td>8</td><td>OOM (80 GB)</td><td>770.8</td><td>runs</td><td>1000.6</td><td>runs</td></tr>
+<tr><td>hstu</td><td>1024</td><td>8</td><td>OOM (80 GB)</td><td>772.8</td><td>runs</td><td>1017.2</td><td>runs</td></tr>
+<tr><td>causal</td><td>120</td><td>4</td><td>43.6</td><td>45.0</td><td class="neg">&minus;3.2%</td><td>61.7</td><td class="neg">&minus;29%</td></tr>
+<tr><td>causal</td><td>120</td><td>8</td><td>91.9</td><td>89.3</td><td class="pos">+2.9%</td><td>120.4</td><td class="neg">&minus;24%</td></tr>
+<tr><td>hstu</td><td>120</td><td>4</td><td>42.9</td><td>45.5</td><td class="neg">&minus;5.7%</td><td>63.1</td><td class="neg">&minus;32%</td></tr>
+<tr><td>hstu</td><td>120</td><td>8</td><td>91.5</td><td>89.8</td><td class="pos">+1.9%</td><td>122.7</td><td class="neg">&minus;25%</td></tr>
+</table>
+<p class="neu">ms; positive = MI300X fused is faster. In short, the fused kernel is at parity with H100 CUTLASS. H100 figures are from a different machine, so indicative rather than a controlled comparison.
+For context, the original FlyDSL split kernel was ~1.40&ndash;1.49x slower than H100 CUTLASS.</p>
+
+
+<!-- ============================================================ -->
+<h2>6. Takeaways</h2>
+<div class="card">
+<ol>
+  <li>Ping-pong works for a gate-style attention too: M = MFMA burst + feed + DMA, V = pure VALU gate. But 8 waves/1 WG costs ~15% up front, so every cycle of the schedule has to be earned back.</li>
+  <li>Inside a phase, <b>latency chains</b> (a packed op waiting on two transcendentals) matter far more than instruction count until the chains are cut.</li>
+  <li>Ping-pong exposes ordering bugs the lockstep kernel hid (publish-before-fence, unwritten LDS rows, ring-index aliasing) &mdash; budget for correctness probes (NaN poison, bitwise A/B vs a twin).</li>
+  <li>Fusion is only worth it if the new cross-WG reduction is cheaper than the work it removes: atomics are a wall, so use disjoint slots + a bandwidth-bound reduce, and then tune the reduce.</li>
+</ol>
+</div>
+
+</section><!-- /page-hstu -->
+<!-- ===================================================================== -->
+<!-- ======================= PAGE 3: HSTU FORWARD ======================== -->
+<!-- ===================================================================== -->
+<section class="page" id="page-fwd">
+
+<h1>HSTU forward: replacing <code>exp</code> + <code>rcp</code> with a lookup table</h1>
+<div class="sub">One trick from the ping-pong forward kernel &mdash; turn the SiLU gate's two quarter-rate transcendentals into one <code>ds_read</code>. MI300X (gfx942), bf16, production shape
+B=1024, H=4, N=16384, d=64, hstu mask.
+Code: <a href="https://github.com/ROCm/aiter/pull/8062">ROCm/aiter PR #8062</a> (<code>aiter/ops/flydsl/kernels/hstu/hstu_attention_fwd_pp.py</code>)</div>
+
+<div class="note">Intermediate numbers are development A/Bs, each with the shipping kernel as an in-process drift control.
+The before-LUT and final numbers were measured on two different MI300X nodes, so the stages are compared as <b>speed-up over the shipping FlyDSL forward on the same machine</b>, never as raw ms.</div>
+
+<!-- ============================================================ -->
+<h2>1. The math, and where the time goes</h2>
+
+<div class="card">
+<p>Forward is simpler than the backward: <b>no softmax, no row statistics</b>, so the KV loop is a plain accumulation (no running max, no rescale of the output).</p>
+<div class="eq">
+  z<sub>ij</sub> = &alpha; &middot; &langle; q<sub>i</sub>, k<sub>j</sub> &rangle; <br>
+  a<sub>ij</sub> = (1/N) &middot; m<sub>ij</sub> &middot; silu(z<sub>ij</sub>), &nbsp; silu(x) = x &middot; &sigma;(x) <br>
+  out<sub>i</sub> = &Sigma;<sub>j</sub> a<sub>ij</sub> &middot; v<sub>j</sub>
+</div>
+<p>N is the global <code>max_seq_len</code>, so 1/N is a constant that is hoisted into the epilogue. A masked score is set to 0 <em>before</em> the gate, which is equivalent because silu(0) = 0.</p>
+
+<h3>The gate in base 2</h3>
+<p>With <code>s = q&middot;k</code> (what the MFMA produces) and <code>g = (&alpha;&middot;&minus;log<sub>2</sub>e) &middot; s</code> (the scale is folded into Q once per workgroup):</p>
+<div class="eq">
+  &sigma; = 1 / (1 + 2<sup>g</sup>) &nbsp;&nbsp;&nbsp;&nbsp; p = g &middot; &sigma;(g) = (&minus;log<sub>2</sub>e) &middot; silu(z)
+</div>
+<pre>g   = s * (alpha * -log2e)    <span class="c"># folded into Q: free</span>
+e   = exp2(g)                 <span class="c"># v_exp_f32   quarter rate (16 cy)</span>
+d   = 1 + e                   <span class="c"># v_add_f32</span>
+sig = rcp(d)                  <span class="c"># v_rcp_f32   quarter rate (16 cy)</span>
+p   = g * sig                 <span class="c"># v_mul_f32</span></pre>
+<p>The leftover &minus;1/log<sub>2</sub>e rides the epilogue's existing 1/N multiply, so the loop never undoes it.</p>
+
+<h3>GEMM structure per KV tile</h3>
+<pre>GEMM1   S<sup>T</sup> = K &middot; Q<sup>T</sup>          <span class="c"># operand swap on purpose: the accumulator fragment is then already
+                                  # the A operand of GEMM2 (free transpose, as in the backward)</span>
+gate    P = silu(mask &middot; S)        <span class="c"># VALU</span>
+GEMM2   O += P &middot; V</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. The forward is VALU-bound, and that decides everything</h2>
+
+<div class="card">
+<p>The forward uses the same ping-pong skeleton as the backward (see tab 2): 8 waves in one workgroup, 1 WG/CU, two groups held half an iteration apart, and the same two phases:</p>
+<ul>
+  <li><b>Phase M</b>: both GEMMs, their LDS operand feed, and this group's K/V staging (g0 stages K, g1 stages V, via global &rarr; VGPR &rarr; <code>ds_write</code>).</li>
+  <li><b>Phase V</b>: the mask and the SiLU gate. <b>No memory operations.</b></li>
+</ul>
+<div class="tl">
+  <div class="lane"><div class="nm">g0</div><div class="cells">
+    <div class="cell v">V(i&minus;1)</div><div class="cell m">M(i)</div><div class="cell v">V(i)</div><div class="cell m">M(i+1)</div><div class="cell v">V(i+1)</div></div></div>
+  <div class="lane"><div class="nm">g1</div><div class="cells">
+    <div class="cell m">M(i)</div><div class="cell v">V(i)</div><div class="cell m">M(i+1)</div><div class="cell v">V(i+1)</div><div class="cell m">M(i+2)</div></div></div>
+</div>
+<p>GEMM2 runs one tile behind (GEMM1(i) and GEMM2(i&minus;1) share phase M; P(i&minus;1) is carried across the barrier, zero-seeded for trip 0), so both GEMMs form one contiguous MFMA burst and the two accumulator chains are independent.
+The shipping geometry is <code>(block_m=512, block_n=32, 8 waves, waves_per_eu=2)</code>.</p>
+
+<h3>The difference from the backward: here the VALU is the bottleneck</h3>
+<p>Counted from the ISA of the first port (unmasked loop body): <b>32 MFMA = 512 cy of matrix core against 848 cy of VALU</b>, and the gate's two quarter-rate transcendentals alone are 512 cy of that.
+The barrier interval is <code>max(M, V)</code>, so phase V is the critical path and the matrix core has slack. That is why longer phases won the first tile sweep (the barrier cost amortises better), and why shaving phase V is the lever.</p>
+</div>
+
+<h3>Phase V before the trick <span class="neu">(ATT per-instruction cycles, 32 elements per lane)</span></h3>
+<table>
+<tr><th>instruction</th><th>count</th><th>cycles</th><th>what</th></tr>
+<tr><td><code>v_exp_f32</code></td><td>32</td><td class="neg">597.0</td><td>e = 2<sup>g</sup></td></tr>
+<tr><td><code>v_add_f32</code></td><td>32</td><td>180.9</td><td>d = 1 + e</td></tr>
+<tr><td><code>v_rcp_f32</code></td><td>32</td><td class="neg">587.1</td><td>&sigma; = 1/d</td></tr>
+<tr><td><code>v_mul_f32</code></td><td>32</td><td>175.1</td><td>p = g &middot; &sigma;</td></tr>
+<tr><td><code>v_perm_b32</code></td><td>16</td><td>64.0</td><td>truncate + pack 2 f32 &rarr; 2 bf16</td></tr>
+<tr><td><code>s_barrier</code></td><td>2</td><td>160.1</td><td>phase boundary</td></tr>
+<tr><td><b>total</b></td><td><b>146</b></td><td><b>1764</b></td><td>exp + rcp = 1184 cy = <b>67%</b> of phase V</td></tr>
+</table>
+
+<figure class="slotfig dark"><img src="pp_hstu_fwd_no_lut.png" alt="WaveScope trace of the ping-pong forward before the LUT" loading="lazy">
+<figcaption><b>Ping-pong forward before the LUT</b> (8 resident waves, one SIMD per W0/W1 pair). The skew is visible: one wave of each pair runs a dense, nearly solid green stretch while its partner shows the broken pattern of the gate, short EXEC segments separated by red STALL ticks (the dependent <code>v_exp</code> &rarr; add &rarr; <code>v_rcp</code> chain),
+followed by an orange LDS/STORE burst (K/V staging) and a long grey WAIT at the barrier. One repeating period is roughly 1.8k cycles on the time axis (read off the screenshot, approximate).</figcaption></figure>
+
+<!-- ============================================================ -->
+<h2>3. The trick: a table lookup instead of exp + add + rcp</h2>
+
+
+<div class="card">
+<p>Phase V computes &sigma;(g) = 1/(1+2<sup>g</sup>) with two quarter-rate transcendentals and an add. &sigma; is a smooth, bounded function of a single scalar, so tabulate it in <b>LDS</b> and read it:</p>
+<pre>p = g * LUT[ index(g) ]          <span class="c"># sigma comes from ds_read_b32; the multiply by g stays</span></pre>
+<p>Phase V then contains <b>zero transcendentals</b>. The instruction count goes <em>up</em> (146 &rarr; 242) but the issue floor falls, because quarter-rate ops are gone:</p>
+<pre>before   64 &times; 16 cy (exp, rcp) + 80 &times; 4 cy (full rate)  = 1344 cy
+after     0 &times; 16              + 176 &times; 4              =  704 cy</pre>
+<p><b>Result: the ping-pong forward goes from 1.269x (before the LUT) to 1.59x (final) over the shipping FlyDSL kernel, accuracy unchanged</b> (&sect;8). It was the largest single win of the whole optimisation effort; the final kernel also includes the address-math and read-pipelining refinements of &sect;5&ndash;6.</p>
+</div>
+
+<div class="twocol">
+<div class="card">
+<b>Before: 4 instructions + 1 mul per element</b>
+<div class="stack" style="margin-top:8px"><div class="stk-t" style="width:76%">transcendental 1024 cy</div><div class="stk-f" style="width:24%">full-rate 320</div></div>
+<div class="neu" style="font-size:.85rem">issue floor 1344 cy, 146 instr</div>
+</div>
+<div class="card">
+<b>After: 4 address/read ops + 1 mul per element</b>
+<div class="stack" style="margin-top:8px"><div class="stk-f" style="width:52%">full-rate 704 cy (176 &times; 4)</div></div>
+<div class="neu" style="font-size:.85rem">issue floor 704 cy, 242 instr &nbsp;&rarr;&nbsp; 576 cy, 193 instr after the magic-number trick (&sect;5)</div>
+</div>
+</div>
+
+<h3>Why the table only has to be good to 2<sup>&minus;8</sup></h3>
+<div class="card">
+<p>The gate output goes through <code>pack_p</code>, which <b>truncates p to bf16</b> to feed GEMM2's A operand. bf16 has 8 bits of precision, so every element already carries up to 2<sup>&minus;7</sup> = 0.78% relative error whatever the gate does.
+A replacement therefore needs ~2<sup>&minus;8</sup>, not f32's 2<sup>&minus;24</sup> &mdash; a ~65,000x relaxation. Since p = g&middot;&sigma; with g exact, the relative error of p equals that of &sigma;.</p>
+<p><b>Measured: max error vs the fp32 oracle is 1.221e-04 on every mask configuration, bit-identical to the exact gate.</b> The table's error sits under a floor that was already there.</p>
+</div>
+
+<h3>Sizing the table</h3>
+<div class="card">
+<p>Nearest-node lookup with step <i>h</i>: the worst case is half a step from a node. With &sigma;&prime; = &minus;ln2 &middot; &sigma;(1&minus;&sigma;):</p>
+<div class="eq">
+  rel err of p = rel err of &sigma; = |&sigma;&prime;|&middot;(h/2) / &sigma; = ln2 &middot; (1 &minus; &sigma;) &middot; h / 2
+</div>
+<p>It is worst as &sigma; &rarr; 0 (large positive g, where 1&minus;&sigma; &rarr; 1), giving <code>ln2 &middot; h/2 = 2<sup>&minus;8</sup></code> &rArr; <b>h = 0.01127</b>. A bisection over 4M samples gives 0.01125, so the closed form is right, not a fit.</p>
+<table>
+<tr><th>choice</th><th>value</th><th>reason</th></tr>
+<tr><td>step h</td><td>0.01125</td><td>node error &le; 2<sup>&minus;8</sup></td></tr>
+<tr><td>range</td><td>g &isin; [&minus;8, +16] (span 24)</td><td>g &lt; &minus;8: 1&minus;&sigma; &lt; 2<sup>&minus;8</sup>, the clamp error stays inside the same budget. g &gt; 16: &sigma; &lt; 2<sup>&minus;16</sup>, the absolute error of p is bounded and far below the bf16 noise of the output accumulator</td></tr>
+<tr><td>entries / bytes</td><td><b>2135 &times; 4 B = 8540 B</b></td><td>LDS 18432 &rarr; 26976 B; still 1 WG/CU, so occupancy is unaffected</td></tr>
+<tr><td>index bias</td><td>+0.5 node</td><td>so truncation behaves as round-to-nearest</td></tr>
+</table>
+<p>The binding constraint is the large-positive-g tail, where p is tiny. At g&asymp;0, where &sigma; actually curves, half the resolution would do. If accuracy were judged by absolute error vs peak |p| (what the accuracy test checks), the table could shrink a lot &mdash; but 2135 is the defensible size without knowing the real score distribution.</p>
+</div>
+
+<h3>The clamp is the saturating branch, not a safety check</h3>
+<div class="card">
+<p>The index is clamped to the table (<code>v_med3_f32</code>), but <code>g</code> in the outer multiply is <b>not</b>. For a strongly passing score (g &rarr; &minus;&infin;): the index sticks at node 0, &sigma; &asymp; 1, and the surviving multiply gives <code>p = g &middot; 1 = g</code>, the correct answer at any magnitude (g = &minus;3455 &rarr; p = &minus;3441.6, 0.4% off, inside the budget).</p>
+<p><b>Why not tabulate p(g) directly and drop the multiply?</b> &sigma; is bounded; p is not. A p-table clamps to a <em>constant</em> and is wrong by |g|: at g = &minus;20, &minus;100, &minus;3455 it returns &minus;7.97. Patching it costs a compare and a select, two instructions to save one multiply. <b>The multiply that survives is what makes the clamp correct.</b>
+A masked score has g = 0, so p = 0 &middot; &sigma; = 0 exactly: masked elements stay exactly zero whatever the table says.</p>
+<canvas id="pplot" width="900" height="300"></canvas>
+<p class="neu" style="font-size:.85rem">p(g) = g&middot;&sigma;(g): exact (white), &sigma;-table with clamp then multiply (green, indistinguishable from exact), p-table with clamp (red, goes flat below g = &minus;8).</p>
+</div>
+
+<h3>Building the table</h3>
+<p>Each workgroup fills the table itself in LDS, using the exact <code>exp2</code>/<code>rcp</code>, before the prologue's publish fence: 5 rounds across the 512 threads, amortised over the ~270 KV tiles that follow. No host table, no extra kernel argument.
+Surplus threads in the last round write the (identical) last entry instead of branching: a store inside a dynamic <code>if</code> breaks FlyDSL's AST rewriter, and the clamped index makes the redundant stores benign.</p>
+
+<!-- ============================================================ -->
+<h2>4. Interactive: what the gate does to one score</h2>
+<div class="card">
+<div class="lutw">
+  <div>
+    <label>g = &alpha;&middot;(&minus;log<sub>2</sub>e)&middot;s</label>
+    <input type="range" id="g_rng" min="-30" max="30" step="0.01" value="0.3">
+    <input type="number" id="g_num" step="any" value="0.3" style="margin-top:6px">
+    <div class="chips" id="g_chips"></div>
+    <table id="lut_out"></table>
+  </div>
+  <div>
+    <canvas id="sigplot" width="760" height="360"></canvas>
+    <div class="neu" style="font-size:.85rem">&sigma;(g) with the table nodes at h = 0.01125 (hidden: indistinguishable from the curve). The marker is the node this g lands on after the clamp. The shaded bands are the clamp regions.</div>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Making the address cheap: the magic-number trick</h2>
+
+<div class="card">
+<p>The first version needed four instructions per element to form the address:</p>
+<pre>v_fmamk_f32    t, g, 1/h, bias      <span class="c"># t = (g - g_lo)/h + 0.5   (fractional node index)</span>
+v_med3_f32     t, t, 0, N-1         <span class="c"># clamp</span>
+v_cvt_i32_f32  i, t                 <span class="c"># truncate to node index</span>
+v_lshlrev_b32  a, 2, i              <span class="c"># byte address = i*4</span></pre>
+<p>The obvious fix is to fold the <code>&times;4</code> into the fma (scale by 4/h). <b>It does not work:</b> <code>trunc(4x) &ne; 4&middot;trunc(x)</code>. It gives an address <em>inside</em> an entry, and masking it back costs the op you saved.</p>
+
+<h3>Let the exponent do the scaling</h3>
+<p>An f32 in [2<sup>21</sup>, 2<sup>22</sup>) is <code>2<sup>21</sup> + m/4</code>, where <code>m</code> is the 23-bit <em>stored</em> mantissa. The spacing of floats there is 0.25, so <b>the mantissa field is the offset from 2<sup>21</sup> counted in quarters: it already equals <code>4 &times; node index</code>, exactly the byte address</b> of a 4-byte table entry.
+So bias the fma into [2<sup>21</sup>, 2<sup>22</sup>), clamp in that domain, and the address is one mask away:</p>
+<div class="eq bitrow" style="line-height:1.5">
+  bits(t) &nbsp;= &nbsp;<span class="bit-s">0</span> <span class="bit-e">10010100</span> <span class="bit-m">mmmmmmmmmmmmmmmmmmmmmmm</span> &nbsp;&nbsp;(exponent 148 = 127 + 21, fixed by the clamp)<br>
+  mask 0x7FFFFC &nbsp;= &nbsp;<span class="bit-z">0 00000000</span> <span class="bit-m">11111111111111111111100</span> &nbsp;&nbsp;(strip exponent, clear the 2 sub-node bits)
+</div>
+<pre>v_fmamk_f32    t, g, 1/h, 2^21 + 711.5   <span class="c"># bias into [2^21, 2^22)</span>
+v_med3_f32     t, t, 2^21, 2^21 + N-1    <span class="c"># clamp IN THE BIASED DOMAIN</span>
+v_and_b32      a, t, 0x7FFFFC            <span class="c"># byte address -- convert and shift are both gone</span>
+ds_read_b32    sigma, a</pre>
+<p>The source writes the element index <code>(bits &gt;&gt; 2) &amp; 0x1FFFFF</code> and lets the LDS view scale it; the backend folds <code>&gt;&gt;2</code>, <code>&amp;</code> and the view's <code>&times;4</code> into a single <code>v_and_b32</code>. Check the ISA rather than assuming: written naively it looks like 3 ops replacing 2.</p>
+<p><b>Phase V: 225 &rarr; 193 instructions (exactly &minus;32), VALU floor 704 &rarr; 576 cy, 104.41 &rarr; 101.07 ms (&minus;3.3%).</b></p>
+
+<h3>Why 2<sup>21</sup> and not the textbook 2<sup>23</sup></h3>
+<table>
+<tr><th>magic</th><th>ULP</th><th>mantissa holds</th><th>to get a byte address</th></tr>
+<tr><td>2<sup>23</sup> (textbook float&rarr;int)</td><td>1</td><td>index</td><td>needs <code>m &lt;&lt; 2</code> &mdash; one op worse</td></tr>
+<tr class="grp"><td><b>2<sup>21</sup></b></td><td><b>0.25</b></td><td><b>index &times; 4</b></td><td class="pos"><b>already there</b></td></tr>
+<tr><td>2<sup>19</sup></td><td>0.0625</td><td>index &times; 16</td><td>needs <code>m &gt;&gt; 2</code></td></tr>
+</table>
+<p>The entry size dictates the constant (a 2-byte table wants 2<sup>22</sup>, an 8-byte table 2<sup>20</sup>).</p>
+
+<h3>The cost</h3>
+<p>The bias must itself be representable in [2<sup>21</sup>, 2<sup>22</sup>), i.e. a multiple of 0.25. The ideal bias 711.611 snaps to <b>711.5</b>, so the rounding point jitters by &plusmn;0.125 node. Max relative error of &sigma; goes 3.906e-3 &rarr; <b>3.998e-3</b> (2% worse) against bf16's own 7.812e-3 truncation floor, so end-to-end accuracy does not move (still 1.221e-04). The neighbouring quarters (711.25, 711.75) are 50% worse for nothing.</p>
+<p><b>Preconditions if you reuse it:</b> fewer than 2<sup>21</sup> entries; the clamp must be in the biased domain (an out-of-range value has a different exponent and the mask returns garbage, so the clamp is load-bearing twice); the entry size fixes the constant.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. The new bottleneck: <code>ds_read</code> latency</h2>
+
+<div class="card">
+<p>With the transcendentals gone, the gate is a stream of address math plus 32 LDS reads per lane. How the reads are grouped decides how much cover each wait gets. Three ideas, together worth a few percent:</p>
+<ul>
+  <li><b>Issue all reads before consuming any.</b> Gating the whole tile as one batch lets the first <code>s_waitcnt</code> cover many multiplies instead of one (&minus;1.5%), and is free in VGPRs because the address register is reused for the loaded &sigma;. The batch size is non-monotonic, so sweep it.</li>
+  <li><b>Software-pipeline the gate.</b> Put the second group's address math between the first group's reads and their consumers, and finish (multiply <em>and pack</em>) one group before touching the other.</li>
+  <li><b>Make the first group small.</b> An uneven split (8 + 24 rather than 16 + 16) cut the waits from 9 to 3: the small first group only needs a few reads to land, and the other 24 drain under its multiplies.</li>
+</ul>
+<p>Even so, <code>ds_read_b32</code> measures ~10 cy/op against phase M's 4.6. Most of that is <em>not</em> recoverable time: ATT's stall is per wave, and while this wave waits the partner wave in phase M keeps issuing. Only the 1.5% above was real.
+The address math also cannot move into the previous phase V: g comes from GEMM1 in the M phase just before it, so the scores do not exist yet.</p>
+</div>
+
+<h3>Bank conflicts: easy to measure wrong</h3>
+<div class="card">
+<p>LDS has 32 banks &times; 4 B. Within a half-wave, different banks are free, the same address is a broadcast (free), different addresses in the same bank serialise. With indices spread over a large table, lanes land in banks like balls in bins: <b>expected max occupancy 3&ndash;4, not 32</b>. Maximal conflict needs the opposite of random: a structured stride that is a multiple of 128 B.</p>
+<table>
+<tr><th>experiment</th><th>measured</th><th>why it was an artifact</th></tr>
+<tr><td>control #1: index from the score's mantissa, read <code>k_smem[r,0,:]</code></td><td class="neg">73 cy/read, 2.7x slowdown</td><td>the K row stride is 128 B = 32 dwords, so every lane hit bank 0 at 32 different addresses: a guaranteed 32-way conflict no real 4-B table has</td></tr>
+<tr><td>control #2: value-derived index, benchmark inputs U(&minus;0.01, 0.01)</td><td>~0 cy/read</td><td>|g| &le; 0.3 is ~2.5% of the table (about 54 of 2135 entries), so 64 lanes crowd into a few adjacent dwords: near-broadcast by construction</td></tr>
+<tr class="grp"><td><b>real: scale q/k until the index spreads</b></td><td class="pos"><b>worst case 1.13x on the LDS step</b></td><td>at the middle scale (whole table hit); improves again at larger scales as scores clamp to the ends and broadcast. Error stays under 1%, 0 NaN</td></tr>
+</table>
+<p><b>Methodology lessons:</b> a subtraction model (total delta minus added VALU) gave a <em>negative</em> read cost, so use a three-way A/B with a no-read control that keeps the index math; when building "remove X" controls watch for dead-code elimination (a control that dropped two of four values let DCE delete half the gate and measured a fake &minus;18.3%); verify every control in the ISA.
+Also keep a stable in-process control: a machine drifting 3&ndash;5% between runs manufactured a false null for a real 1.5% effect.</p>
+<p class="neu">Open risk: real HSTU score distributions are unmeasured; the 1.13x worst case came from artificially scaled synthetic inputs.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. What else was tried instead (and why the LUT won)</h2>
+<table>
+<tr><th>idea</th><th>verdict</th><th>why</th></tr>
+<tr><td><b>Interpolated table</b> (value + slope, 96 entries, 768 B)</td><td class="neg">+21% slower</td><td>adds <code>v_fract</code> + <code>v_fmac</code> per element (+256 cy issue floor); the 24x smaller table buys nothing because conflicts were already near-free. <b>When a lookup is ALU-bound, spend table bytes to buy instructions, never the reverse.</b> Direct nearest-node: 104.43 ms; lerp: 126.45</td></tr>
+<tr><td>Direct p-table (drop the multiply)</td><td class="neg">wrong</td><td>p is unbounded, a clamped p-table is off by |g|; the fix costs more than the multiply it saves (&sect;3)</td></tr>
+<tr><td>Schraudolph bit-trick exp2</td><td>1.320x</td><td>removes 1 transcendental per element; the LUT removes 2 plus the add and reaches 1.391x. They are mutually exclusive (both replace exp2)</td></tr>
+<tr><td>Batch inversion for <code>rcp</code></td><td class="neg">8&ndash;12% slower</td><td>only 4 cy/element of headroom (full:quarter rate is 4:1); normalising costs more than the saving and the serial prefix-product chain replaces 32 independent reciprocals</td></tr>
+<tr><td>gfx942 packed FP32 (<code>v_pk_add/mul_f32</code>)</td><td class="neg">16% slower</td><td>a packed op is a <b>join</b>: it waits on both halves' producers, halving the independent chains (same finding as the backward gate)</td></tr>
+<tr><td>Removing one of the two barriers</td><td class="neg">14% slower</td><td>the barrier is the ping-pong's arbitration, not overhead; the groups drift out of opposite phases</td></tr>
+<tr><td>32x32x8 MFMA instead of 16x16x16</td><td class="neg">no gain</td><td>matrix time identical at 1024 cy, and the 32x32 accumulator layout breaks the operand swap that keeps P in registers</td></tr>
+<tr><td>MFMA for the bf16 pack</td><td class="neg">no</td><td>no packed-bf16 MFMA destination on gfx942; and 4 cy/result is the same as <code>v_perm_b32</code></td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>8. Results</h2>
+
+<h3>Four stages: shipping, ping-pong, optimised, final</h3>
+<p>The shipping FlyDSL forward is the fixed reference (the LUT and everything else below only touch the ping-pong kernel). B=1024, H=4, N=16384, d=64, hstu mask. Speed-ups are over the shipping kernel <em>on the same machine</em>.</p>
+<div class="card bars" id="fwdbars"></div>
+<table>
+<tr><th>#</th><th>stage</th><th>what changed</th><th>speed-up over shipping</th><th>ms: node A</th><th>ms: node B</th></tr>
+<tr><td>1</td><td><b>shipping kernel</b> <code>(128,32,4,2)</code></td><td>the existing non-ping-pong forward</td><td>1.00x</td><td>144.25</td><td>134.6</td></tr>
+<tr><td>2</td><td><b>apply the ping-pong framework</b></td><td>8 waves / 1 WG per CU, half-iteration skew + <code>s_setprio</code>, GEMM2 one tile behind (rotation), K/V staging split between the two groups, <code>vectorize-slp=False</code>, tile (384,64)</td><td>1.03x</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td>3</td><td><b>optimise, before the LUT</b> <code>(512,32,8,2)</code></td><td>packed bf16 via <code>v_perm_b32</code>; &alpha;&middot;&minus;log2e folded into Q; staging fixes (carried address, hardware bounds check, zero-guard at the consumer, rotated V double-buffer); rolling MFMA operand window; per-column / per-row-border mask and skipping the gate on blocks the diagonal never reaches</td><td class="pos"><b>1.269x</b> (&minus;21.2%)</td><td><b>113.67</b></td><td>&mdash;</td></tr>
+<tr><td>4</td><td><b>final kernel</b></td><td>sigma LUT in LDS (&sect;3), magic-number addressing (&sect;5), gate read pipelining 8+24 (&sect;6), staging-store interleave</td><td class="pos"><b>1.59x</b></td><td>&mdash;</td><td class="pos"><b>84.8</b></td></tr>
+</table>
+<p class="neu">&ldquo;&mdash;&rdquo; = not measured on that node; ms are never derived by dividing across machines. Stage 2 is a ratio from an earlier same-process A/B (141.9 vs 146.3 ms), which is why only the ratio is shown.</p>
+
+<figure class="slotfig dark"><img src="pp_hstu_fwd_no_lut.png" alt="WaveScope trace before the LUT" loading="lazy">
+<figcaption><b>Before the LUT</b> (same trace as in &sect;2, repeated here for the comparison). Gate stretches are broken by red STALL ticks (the dependent <code>v_exp</code> &rarr; add &rarr; <code>v_rcp</code> chain); period roughly 1.8k cycles.</figcaption></figure>
+<figure class="slotfig dark"><img src="pp_hstu_lut.png" alt="WaveScope trace of the ping-pong forward with the LUT gate" loading="lazy">
+<figcaption><b>Ping-pong forward after the LUT.</b> The red lines span one repeating period, about 1.25k cycles on the time axis, against roughly 1.8k before (both read off the screenshots, approximate). The gate stretches are no longer broken by STALL ticks, and the orange LDS bands in the gate phase are heavier: those are the 32 sigma <code>ds_read</code>s per lane
+(plus the staging stores) that replaced the transcendentals.</figcaption></figure>
+
+<div class="card">
+<b>Per score element, before vs after</b>
+<div class="flow">
+  <div class="rowlab">Before <small>exact gate, a dependent chain</small></div>
+  <div class="grpwrap">
+    <div class="grp old"><div class="cap">2 transcendentals + 1 add</div>
+      <div class="chips2">
+        <div class="op tr"><b>v_exp_f32</b><i>e = 2<sup>g</sup></i><u>quarter rate, 16 cy</u></div><span class="ar">&rarr;</span>
+        <div class="op vl"><b>v_add_f32</b><i>d = 1 + e</i><u>4 cy</u></div><span class="ar">&rarr;</span>
+        <div class="op tr"><b>v_rcp_f32</b><i>&sigma; = 1 / d</i><u>quarter rate, 16 cy</u></div>
+      </div></div>
+    <span class="ar" style="align-self:center">&rarr;</span>
+    <div class="grp same"><div class="cap">unchanged</div>
+      <div class="chips2"><div class="op mu"><b>v_mul_f32</b><i>p = g &middot; &sigma;</i><u>4 cy</u></div></div></div>
+  </div>
+  <div class="sum">Replaced part: 16 + 4 + 16 = <b>36 cy</b> &nbsp;&middot;&nbsp; with the unchanged multiply (+4): <b>40 cy</b> per element &nbsp;&middot;&nbsp; <b>2 transcendentals</b>, 4 VALU ops, no LDS</div>
+
+  <div class="rowlab" style="margin-top:20px">After <small>sigma comes from a table in LDS</small></div>
+  <div class="grpwrap">
+    <div class="grp new"><div class="cap">3 full-rate VALU + 1 ds_read</div>
+      <div class="chips2">
+        <div class="op vl"><b>v_fmamk_f32</b><i>t = g/h + 2<sup>21</sup>+711.5</i><u>4 cy</u></div><span class="ar">&rarr;</span>
+        <div class="op vl"><b>v_med3_f32</b><i>clamp to the table</i><u>4 cy</u></div><span class="ar">&rarr;</span>
+        <div class="op vl"><b>v_and_b32</b><i>byte address</i><u>4 cy</u></div><span class="ar">&rarr;</span>
+        <div class="op ld"><b>ds_read_b32</b><i>&sigma; = LUT[addr]</i><u>LDS, latency hidden by grouping</u></div>
+      </div></div>
+    <span class="ar" style="align-self:center">&rarr;</span>
+    <div class="grp same"><div class="cap">unchanged</div>
+      <div class="chips2"><div class="op mu"><b>v_mul_f32</b><i>p = g &middot; &sigma;</i><u>4 cy</u></div></div></div>
+  </div>
+  <div class="sum">Replacing part: 4 + 4 + 4 = <b>12 cy</b> + 1 <code>ds_read</code> &nbsp;&middot;&nbsp; with the unchanged multiply (+4): <b>16 cy</b> per element &nbsp;&middot;&nbsp; <b>0 transcendentals</b>, 4 VALU ops (all full rate)</div>
+</div>
+<p style="margin-top:6px">The exp / add / rcp trio (red) is replaced by three cheap address ops and one LDS read (green + orange). The same four VALU slots are still spent per element, but none is quarter-rate, so the issue cost of the replaced part drops from 36 to 12 cy (40 to 16 cy per element including the shared multiply).
+Across the 32 elements a lane gates per phase (including the half-pack per element) that is the 1344 &rarr; 576 cy floor below.</p>
+</div>
+
+<table>
+<tr><th>per phase V (per wave, 32 elements per lane)</th><th>before LUT</th><th>after LUT</th></tr>
+<tr><td>instructions</td><td>146</td><td>242 &rarr; 193 (magic) &rarr; 181 (8+24 split)</td></tr>
+<tr><td>issue floor</td><td>1344 cy</td><td class="pos">704 &rarr; 576 cy (&minus;57%)</td></tr>
+<tr><td>transcendentals</td><td>64</td><td class="pos">0</td></tr>
+<tr><td>LDS</td><td>18432 B</td><td>26976 B (+8540 B, occupancy unchanged)</td></tr>
+<tr><td>VGPR / spills / WG per CU</td><td colspan="2">244 / 0 / 1 (unchanged)</td></tr>
+<tr><td>max err vs fp32 oracle</td><td colspan="2">1.221e-04 (identical, every mask config)</td></tr>
+</table>
+
+<h3>Final: ping-pong forward vs FlyDSL, CK and H100 CUTLASS</h3>
+<p>MI300X, hstu mask, N=16384, d=64, ms. "current FlyDSL" is the shipping non-ping-pong forward.</p>
+<table>
+<tr><th>hstu mask</th><th>ping-pong</th><th>current FlyDSL</th><th>pp speed-up vs FlyDSL</th><th>CK</th><th>H100 CUTLASS</th><th>pp / H100 time</th></tr>
+<tr><td>B=1024 H=4</td><td class="pos"><b>84.8</b></td><td>134.6</td><td class="pos">1.59x</td><td>154.5</td><td>88.3</td><td class="pos">0.96x</td></tr>
+<tr><td>B=1024 H=8</td><td class="pos"><b>168.5</b></td><td>273.6</td><td class="pos">1.62x</td><td>308.7</td><td>176.6</td><td class="pos">0.95x</td></tr>
+<tr><td>B=120 H=4</td><td><b>11.9</b></td><td>18.7</td><td class="pos">1.57x</td><td>20.7</td><td>10.6</td><td class="neg">1.13x</td></tr>
+<tr><td>B=120 H=8</td><td><b>22.8</b></td><td>36.5</td><td class="pos">1.60x</td><td>40.0</td><td>22.2</td><td class="neg">1.03x</td></tr>
+</table>
+<p class="neu">Speed-up column computed from the two columns before it (1.57&ndash;1.62x). pp / H100 &lt; 1 means the MI300X ping-pong forward is faster than H100 CUTLASS (training shapes); &gt; 1 is slower (small inference shapes). The H100 figures are from a different machine, so indicative rather than a controlled comparison.
+This is the whole ping-pong kernel: the sigma LUT is the largest single contributor, on top of v_perm packing, folding &alpha;&middot;&minus;log2e into Q, mask simplification and the staging changes.</p>
+
+<!-- ============================================================ -->
+<h2>9. Takeaways</h2>
+<div class="card">
+<ol>
+  <li><b>Find which unit is the bottleneck before you copy a schedule.</b> The backward is MFMA/latency-bound; the forward is VALU-bound, so ping-pong alone gave 1.03x and the real lever was shrinking the gate.</li>
+  <li><b>More instructions can be faster.</b> The LUT gate went from 146 to 242 instructions and still got faster, because the issue floor counts cycles, and quarter-rate transcendentals are 4x a normal op.</li>
+  <li><b>Judge accuracy at the point where the error comes to rest.</b> The bf16 pack already costs 2<sup>&minus;7</sup>, so a table good to 2<sup>&minus;8</sup> is free, and the accuracy result was bit-identical.</li>
+  <li><b>Clamp the index, never the multiplicand.</b> The multiply by g that stays behind is what makes a bounded table right for an unbounded p.</li>
+  <li><b>Let float formats do your integer math.</b> A magic exponent made the mantissa the byte address and removed two instructions per element.</li>
+  <li><b>Measure the memory side honestly.</b> Two bank-conflict controls were artifacts (an accidental 128 B stride; a clustered index). Scale the inputs until the index spreads, verify controls in the ISA, and keep an in-process drift control.</li>
+</ol>
+</div>
+
+</section><!-- /page-fwd -->
+<!-- ===================================================================== -->
+<!-- ====================== PAGE 4: SPARSE MLA PP ======================== -->
+<!-- ===================================================================== -->
+<section class="page" id="page-spmla">
+
+<h1>Ping-pong on a gather-bound kernel: GLM-5.3-Flash sparse MLA prefill</h1>
+<div class="sub">Applying the ping-pong schedule to a kernel whose bottleneck is the memory system, not the matrix core. MI300X / MI325X (gfx942), bf16, H=16, D=512, top-k=2048.
+Compared with a one-query-per-workgroup baseline and with a non-ping-pong FlyDSL kernel (Yash's).
+Code and benchmark: <a href="https://github.com/ROCm/aiter/tree/ws/glm53-sparse-mla-flydsl">ROCm/aiter, branch <code>ws/glm53-sparse-mla-flydsl</code></a>.</div>
+
+<div class="note">Intermediate numbers are development A/Bs, interleaved against the one-query kernel on the same day (MI300X unless stated, older FlyDSL for the early steps); the final rows are on MI325X / MI300X with FlyDSL 0.5.0, so compare ratios within a row, not ms across rows.</div>
+
+<!-- ============================================================ -->
+<h2>1. The workload</h2>
+
+<div class="card">
+<p><b>Sparse MLA prefill.</b> Each query token attends to only its <b>top-k = 2048</b> most relevant past rows, picked by an indexer, so the kernel <em>gathers</em> 2048 scattered 1 KiB rows per token from a big KV pool. MLA stores one 512-wide latent row per past token that serves as both key and value, and all <b>H = 16</b> heads of a token read the same rows.</p>
+<div class="eq">
+  s<sub>j</sub> = c &middot; (q &middot; kv[idx<sub>j</sub>]) &nbsp;&nbsp; j = 0 &hellip; 2047 <br>
+  out = &Sigma;<sub>j</sub> softmax(s)<sub>j</sub> &middot; kv[idx<sub>j</sub>] &nbsp;&nbsp; (D = 512, bf16: one row = 1 KiB)
+</div>
+<p>The kernel walks the list in <b>tiles of 16 rows</b> (128 tiles per token) with an online softmax: running max <i>m</i>, running sum <i>l</i>, accumulator <i>acc</i>, and a <b>lazy rescale</b> (the stale max is kept until a score exceeds it by &tau; = 8 in log2 units, so the 512-wide accumulator is almost never rescaled).
+Per tile there are two matrix products with a softmax between them, and <b>PV cannot start until the softmax of the same tile is done</b>:</p>
+<pre>QK   S<sup>T</sup> = K_tile &middot; Q<sup>T</sup>     <span class="c"># 16 rows x 16 heads, MFMA; computed transposed so P feeds PV with no shuffle</span>
+softmax  P = exp(S - m)     <span class="c"># VALU</span>
+PV   acc += P &middot; V_tile     <span class="c"># 16 x 512 update, MFMA; V = the same rows, needed TRANSPOSED (rows as the K dimension)</span></pre>
+<p>Per (token, tile): 64 MFMAs (32 per wave when two waves split D in halves), one 16 KiB gather, and a 64-byte index load that is on the critical path.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. The production regime: a 4 GiB pool, a 128 MiB working set</h2>
+
+<div class="card">
+<p>From the GLM-5.3-Flash serving log (vLLM, MI325X, TP4, 16K-token prefill chunks, prefix caching off): the KV pool is <b>3640 pages &times; 1152 rows = 4,193,280 rows (4 GiB)</b>, but a chunk only touches its own request's prefix, <b>&le; 131K rows = 128 MiB</b>, in ~114 pages scattered over the pool. Every token has its own top-k list (no sharing between neighbouring tokens).</p>
+<div class="bars" style="margin:10px 0">
+  <div class="bar"><div class="lb" style="width:230px">KV pool (allocated)</div><div class="fill" style="width:60%"></div><div class="v">4096 MiB</div></div>
+  <div class="bar"><div class="lb" style="width:230px">Infinity Cache (MALL)</div><div class="fill" style="width:3.75%;background:#8de8a0"></div><div class="v">256 MiB</div></div>
+  <div class="bar"><div class="lb" style="width:230px">working set of one 16K chunk</div><div class="fill" style="width:1.9%;background:#ffcb6b"></div><div class="v">128 MiB (131,014 distinct rows)</div></div>
+</div>
+<p>So although the kernel appears to fetch 2048 &times; 16384 = <b>33.5 M rows (34.4 GB)</b>, they are drawn from 131K rows. Compulsory HBM traffic is 128 MiB, about 22 &micro;s at 6 TB/s, so <b>HBM bandwidth is not the bottleneck</b>. The data path is HBM &rarr; Infinity Cache &rarr; L2 &rarr; L1 &rarr; LDS, and the limit is the Infinity-Cache bandwidth and the L2 hit rate. (The measured effective bandwidth, 6.5&ndash;9 TB/s, exceeds the HBM peak for exactly this reason.)</p>
+<p><b>Benchmark ("paged")</b>: the full 3640 &times; 1152 pool, one 131K-token request on 114 randomly placed pages, chunk = the last T = 16384 positions, causal top-k of 2048 rows per token, cache flushed, fp32-oracle checked (max err 1.23e-3).
+Run on the reference branch with:</p>
+<pre>python3 op_tests/test_flydsl_sparse_mla.py --suite performance -t 16384 --order logical topk -s 0 1</pre>
+<p>Target: with no shared rows, beat 10.36 ms and get close to 5.7 ms.</p>
+<p class="neu">Reuse of identical top-k lists across tokens (which some serving runs show) is a separate path handled by the Q-block kernel; this page is the one-list-per-token case (G = 1), which is what the real-model A/B hit.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. The baseline: the one-query kernel is latency-bound</h2>
+
+<div class="card">
+<p><b>One token per workgroup, 2 waves, 4 WGs per CU</b> (so 2 waves per SIMD, from four unrelated WGs). The two waves split D in halves (wave 0: d &lt; 256, wave 1: d &ge; 256) for both products. Per tile:</p>
+<pre>1  wait for this tile's rows (loaded during the previous tile); write them to LDS
+2  barrier
+3  load the NEXT tile's 16 row numbers (idx), WAIT for them, then issue the next gather
+4  QK on my half of D            -> partial scores S_lo / S_hi
+5  write partial to LDS, barrier, read partner's partial, add -> full S
+6  softmax -> P
+7  PV on my half of D
+8  barrier</pre>
+<p>Measured cost of one tile (one wave, cycles):</p>
+<table>
+<tr><th>part</th><th>cycles</th></tr>
+<tr><td><b>whole tile (median)</b></td><td><b>4,640</b></td></tr>
+<tr><td>waiting for the 64-byte index load (step 3)</td><td class="neg">1,804</td></tr>
+<tr><td>waiting for the gathered rows (step 1)</td><td>568</td></tr>
+<tr><td>three barriers</td><td>~360</td></tr>
+<tr><td>waiting for LDS to drain before barriers</td><td>~240</td></tr>
+<tr><td>actual matrix work (32 MFMAs &times; 16 cy)</td><td>512</td></tr>
+</table>
+<p>The matrix core is busy only <b>~18%</b> of the time and the waves spend <b>~65%</b> waiting: a chain of dependent waits per tile (index &rarr; gather &rarr; barrier &rarr; exchange &rarr; barrier), and the two waves on a SIMD often wait at the same moment. That is the lockstep problem from page 1, except here the slack is memory latency (a gathered row takes ~2000 cy, an index load ~1800 cy), not the VALU.</p>
+</div>
+
+
+<!-- ============================================================ -->
+<h2>4. The ping-pong design</h2>
+
+<div class="card">
+<p>Same recipe as pages 1&ndash;3: <b>one 8-wave workgroup per CU</b>, two groups of four waves (g0 = waves 0&ndash;3, g1 = waves 4&ndash;7), one wave of each per SIMD, held half an interval apart by one extra barrier. Every interval is one of two phases, and the interval length is <code>I = max(t<sub>M</sub>, t<sub>V</sub>)</code>:</p>
+<ul>
+  <li><b>Phase M</b> (matrix): the MFMAs, with their operands already in registers.</li>
+  <li><b>Phase V</b> (everything else): partial-score exchange, softmax, the V transpose, and issuing the future gathers and index loads.</li>
+</ul>
+<div class="tl">
+  <div class="lane"><div class="nm">g0 (tokens a, b)</div><div class="cells">
+    <div class="cell m">M(t)</div><div class="cell v">V(t)</div><div class="cell m">M(t+1)</div><div class="cell v">V(t+1)</div><div class="cell m">M(t+2)</div></div></div>
+  <div class="lane"><div class="nm">g1 (tokens c, d)</div><div class="cells">
+    <div class="cell v">V(t&minus;1)</div><div class="cell m">M(t)</div><div class="cell v">V(t)</div><div class="cell m">M(t+1)</div><div class="cell v">V(t+1)</div></div></div>
+  <div class="barline"><div>s_barrier</div><div>s_barrier</div><div>s_barrier</div><div>s_barrier</div><div>s_barrier</div></div>
+</div>
+
+<h3>What is different from the HSTU kernels</h3>
+<ul>
+  <li><b>The two groups share nothing.</b> A workgroup is <b>4 tokens</b>: g0 handles tokens a and b, g1 tokens c and d, each token on a pair of waves that split D. Different tokens, different rows, different LDS regions, so the barrier only keeps time and never has to protect data passed between groups (no cross-group race, unlike the backward).</li>
+  <li><b>PV runs one tile behind</b>, as in the forward: M(t) = PV(t&minus;1) + QK(t), 16 + 16 = 32 MFMAs per wave, all operands in registers. V(t) = exchange partials, softmax(t) &rarr; P(t), build V<sup>T</sup>, issue the gather for a later tile. The cost is two live tiles per token.</li>
+  <li><b>Each wave gathers only the D-half it uses, straight into the MFMA operand layout</b> (lane r = row slot, 8 numbers = two MFMAs' worth). K goes from memory directly into QK: no LDS for QK, no barrier to share the tile, and the lane's own copy of the row index replaces the <code>v_readlane</code> broadcast. LDS is needed only for the transpose PV requires.</li>
+  <li><b>Budgets are tight:</b> 8 waves &times; 8 KiB = exactly 64 KiB LDS in the first design, ~220 of 256 VGPRs per wave, and above 128 VGPRs no second 8-wave WG fits on the CU, which guarantees the one-WG-per-CU the barrier needs.</li>
+</ul>
+
+<h3>The price, and the balance check</h3>
+<p>One WG per CU removes the co-resident WGs that covered each other's stalls. Measured for the lockstep 8-wave control (same kernel, no skew): <b>+10&ndash;12%</b>. Phase M is 32 MFMAs = <b>512 cy</b> of matrix time; in the first design phase V moved 68 KiB through the CU's one LDS unit, at least <b>544 cy</b>. The two are close by construction, so <code>max(t<sub>M</sub>, t<sub>V</sub>)</code> wastes little <em>if nothing waits for memory</em>.
+The whole question is therefore whether the gather can be fed fast enough.</p>
+</div>
+
+<h3>Prefetch distance is the real constraint</h3>
+<div class="card">
+<p>A gathered row arrives ~2000 cy after it is requested (~3000 for the slowest 10%). By Little's law, <code>throughput = bytes in flight / latency</code>: to consume one 16 KiB tile for each of 4 tokens every ~2000 cy the CU needs ~64 KiB in flight, which is one tile per wave and exactly what the register budget allows. Going faster needs either more registers or a design that frees them (this is why later rungs shrink the register footprint).
+Indices are the other chain: each token's list is read 64 B per tile and is in no cache, so its ~1800 cy latency is hidden only by keeping several tiles of indices in flight (one register per tile).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. First result, and the first trace</h2>
+
+<figure class="slotfig dark"><img src="spmla_pp_trace_first.png" alt="WaveScope trace of the first ping-pong version" loading="lazy">
+<figcaption><b>First ping-pong version</b> (8 resident waves). The two red lines are phase barriers. Between them one group runs MFMAs (dense green) while the other does the LDS / VMEM work (orange STORE/LDS, then a long yellow VMEM stretch), and they swap roles each phase: the skew works.
+The problem is the long yellow-VMEM and grey-WAIT stretches in the memory phase: <b>if that wait could be removed the kernel would be at least 2x faster</b>.</figcaption></figure>
+
+<table>
+<tr><th>first version, MI300X, median &micro;s</th><th>one_q</th><th>fly_pp</th><th>ratio</th></tr>
+<tr><td><b>paged T=16384</b> (interleaved A/B)</td><td>6724</td><td class="pos"><b>6546</b></td><td class="pos"><b>0.974</b></td></tr>
+<tr><td>uniform 128 MiB, T=1024</td><td>347</td><td>428</td><td class="neg">1.23</td></tr>
+<tr><td>uniform 128 MiB, T=37</td><td>161</td><td>320</td><td class="neg">1.99</td></tr>
+<tr><td>uniform 4 MiB (L2-resident), T=16384</td><td>3949</td><td>5320</td><td class="neg">1.35</td></tr>
+</table>
+<p class="neu">Bitwise identical to the one-query kernel; 249 VGPR, 0 spills, 64 KiB LDS, 1 WG/CU. The ping-pong only pays at full occupancy on the paged pattern: below ~3 WGs/CU (T &lt; ~4K) the 4-token WGs leave CUs idle, and when the data is L2-resident the matrix work is exposed instead of hidden.</p>
+
+<!-- ============================================================ -->
+<h2>6. The optimisation ladder</h2>
+<p>Paged T=16384, topk=2048, G=1. Everything is <b>bitwise identical</b> to the one-query kernel. The steps fall into three groups:</p>
+
+<table class="tricks">
+<tr><th>group</th><th>what was done</th><th>pp / one_q</th></tr>
+<tr><td>Make phase M cheap</td><td>Build V<sup>T</sup> in phase M with <b>identity MFMAs</b> on the registers that already fed QK (x&middot;1.0 is exact) instead of an LDS write + transposed read in phase V; park some Q fragments in LDS to pay for the extra live registers (otherwise it spills); spread the gather loads through the softmax instead of one burst; keep the packed-FP32 vectoriser off.</td><td class="pos">0.974 &rarr; ~0.95</td></tr>
+<tr><td>Make the gather efficient (the real bottleneck)</td><td>Hardware counters showed the gather bound <em>inside the CU</em>: in MFMA operand order the four lanes reading one row are 16 lanes apart, so the address unit cannot merge them and L1 spent 65% of its time on tag conflicts. Fix: a <b>coalescable gather</b> (consecutive lanes read consecutive chunks of a row) followed by <code>ds_bpermute</code> into MFMA order, with the permutes <b>interleaved one-by-one with the MFMAs</b> so the matrix core never waits for all of them. Then gather only one tile ahead into the register buffer M just drained: more cycles, but fewer VGPRs and a higher clock under the power cap.</td><td class="pos"><b>~0.95 &rarr; 0.815</b></td></tr>
+<tr><td>A steady stream of loads in both phases (an idea from Yash's kernel)</td><td>Issue half of the next tile's gather in phase M, each load right after the permute that frees its register, the other half in phase V. Both groups now issue loads in both phases, one every few MFMAs, instead of V-only bursts.</td><td class="pos"><b>0.618</b> (MI325X)</td></tr>
+<tr><td>Neutral</td><td>Spreading the parked-Q reads through the burst; an XCD-aware token remap so concurrent workgroups on one L2 take adjacent tokens (neutral on synthetic lists, aimed at real indexer output).</td><td class="neu">~1.00</td></tr>
+</table>
+<p class="neu">The load-stream step on other setups (MI325X, flydsl 0.5.0): paged 2 requests 4433 &rarr; 4068 (0.918); shuffled lists 6248 &rarr; 6366 (1.019, slightly worse); <b>uniform 4 GiB (HBM-bound) 7370 &rarr; 8337 (1.131, a regression)</b>: there the loads stall at issue and in M a stalled load blocks the MFMAs behind it.</p>
+
+<div class="card bars" id="spbars"></div>
+<p class="neu" style="font-size:.85rem">Paged T=16384, pp time / one_q time (lower is better); each bar uses the one_q of the same A/B. The last bar is MI325X (one_q 6175 &micro;s), the earlier ones MI300X.</p>
+
+<!-- ============================================================ -->
+<h2>7. Why the gather is the limit: counters, power cap, and what did not work</h2>
+
+<div class="card">
+<h3>After the coalesced gather (measured with hardware counters)</h3>
+<table>
+<tr><th></th><th>pp (coalesced)</th><th>pp (not coalesced)</th><th>one_q</th></tr>
+<tr><td>L1 tag-conflict stall</td><td class="pos">0.6%</td><td class="neg">64.9%</td><td>0.5%</td></tr>
+<tr><td>L1 pending on L2</td><td>60.9%</td><td>6.9%</td><td>71.3%</td></tr>
+<tr><td>tag lookups per load</td><td>15.4</td><td>57.7</td><td>15.4</td></tr>
+<tr><td>L2 hit rate</td><td>36%</td><td>42%</td><td>13%</td></tr>
+</table>
+<p>With the conflicts gone the stall moves to the next level: <b>the L1 is waiting on L2 returns</b> (one request per 128 B line, L2 &rarr; fabric read latency ~385 cy, no credit stalls). The bound is <b>L1 miss capacity &times; L2/MALL latency</b> (Little's law), so issue order, prefetch depth and coalescing cannot push it further. The phase-arrival data caps any fix to the load stall at ~13% before phase M becomes the limit (M and V are both ~1400 cy; V arrives last at 69% of barriers, by ~212 cy).</p>
+
+<h3>The kernel runs at the power cap</h3>
+<p>Every variant, even a gather-only kernel with no math, draws the stock <b>750 W</b>, and sclk drops to 1.2&ndash;1.7 GHz (one_q 1.21, 8-wave ping-pong 1.34, gather-only 1.71). The gather costs a roughly constant ~9&ndash;10 M shader cycles. So wall time = (nearly fixed cycles) / clock, and <b>the real metric is energy per tile</b>: a schedule that saves cycles but adds power nets out to nothing (that is why <code>prefetch_depth=1</code> won with more cycles, and why V<sup>T</sup>-by-MFMA won only 3.5% despite 12% fewer cycles).</p>
+<p>Locality matters too: in an earlier build the L2 hit rate on the paged pattern was 45% for pp vs 13% for one_q (36% after the coalesced gather), but the hits come from the <em>sorted</em> synthetic lists being walked at the same pace (same ~1K-row window per tile step), not from neighbouring tokens. Shuffle the lists and pp falls to 7% hit and is 1.056x <em>slower</em> than one_q. Whether vLLM's index lists are sorted is an open question.</p>
+</div>
+
+<h3>Measured and rejected</h3>
+<table>
+<tr><th>experiment</th><th>result</th><th>why</th></tr>
+<tr><td>8-wave lockstep control (no skew)</td><td class="neg">+10&ndash;12%</td><td>the entry fee of one WG per CU, before any ping-pong</td></tr>
+<tr><td>D-split row-per-lane gather in the one-query kernel</td><td class="neg">1.06x slower</td><td>16 half-used lines per dwordx4: par at MALL, 2.5x slower when L2-resident</td></tr>
+<tr><td>V<sup>T</sup> re-gathered from memory</td><td class="neg">1.5&ndash;1.8x slower</td><td>doubles the gather</td></tr>
+<tr><td>1 token per WG, D in eighths (2 WG/CU)</td><td class="neg">1.11x slower than the 4-wave kernel</td><td>per-WG overhead (prologue, drain trip, epilogue, slot gap ~5.5%) paid per token, plus a 2.7% lower clock</td></tr>
+<tr><td>KV load cache bits: <code>sc1</code> / <code>nt</code></td><td class="neg">1.06x / 1.95x</td><td><code>sc1</code> doubles L1&rarr;L2 requests; <code>nt</code> pushes every gathered byte across the fabric (latency 680 cy, sclk 1.13 GHz)</td></tr>
+<tr><td>Q fragments kept in registers (<code>q_lds=0</code>)</td><td class="neg">1.04x</td><td>fits in 255 VGPR but loses</td></tr>
+<tr><td>Moving the M-phase <code>vmcnt</code> waits around</td><td class="neu">0&ndash;2%</td><td>the gather/clock bound just reappears elsewhere</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>8. Traces: what moved</h2>
+<figure class="slotfig dark"><img src="spmla_pp_trace_balanced.png" alt="WaveScope trace of the ping-pong after the gather work" loading="lazy">
+<figcaption><b>Ping-pong after the gather / coalescing work</b> (~2.5 K cycles shown). The two phases have become more balanced, but there are still a lot of stalls (red STALL ticks, grey WAIT, long yellow VMEM blocks on some waves), which means there is still room for improvement.</figcaption></figure>
+
+<!-- ============================================================ -->
+<h2>9. Results</h2>
+
+<h3>Ping-pong vs the one-query kernel</h3>
+<table>
+<tr><th>date, machine (flydsl)</th><th>one_q &micro;s</th><th>fly_pp &micro;s</th><th>speed-up</th><th>effective TB/s (pp)</th></tr>
+<tr><td>11-09, MI300X (0.3.4.1), first version</td><td>6692</td><td>6498</td><td>1.03x</td><td>5.37</td></tr>
+<tr><td>11-11, MI300X (0.4.2)</td><td>6636</td><td class="pos">5405</td><td class="pos"><b>1.228x</b></td><td>6.46</td></tr>
+<tr><td>11-11, MI325X (0.4.2)</td><td>6175</td><td class="pos">5010</td><td class="pos"><b>1.232x</b></td><td>6.97</td></tr>
+</table>
+<p class="neu">&ldquo;TB/s&rdquo; is logical bytes (34.4 GB) / time, so values above the ~6 TB/s HBM peak mean the Infinity Cache is serving the gathers.</p>
+
+<h3>Final comparison: one-query vs Yash's kernel vs ping-pong (MI325X)</h3>
+<p>Yash's kernel (<code>flydsl_sparse_mla_fwd</code>) is a <b>non-ping-pong</b> design: one wave per token over the full D = 512, AGPR accumulators, no LDS on the register-V<sup>T</sup> route. It tries to get rid of the waits entirely rather than overlap them, and combines the Infinity-Cache insight with his earlier optimisations; he measured ~4.5 ms (no reuse) on the paged bench before sharing it.
+The final ping-pong kernel adds his idea of distributing the <code>buffer_load</code>s evenly across both phases (<code>gather_in_m=4</code>).</p>
+<div class="card bars" id="spfinal"></div>
+<table>
+<tr><th>MI325X, flydsl 0.5.0, paged T=16384, topk=2048</th><th>median &micro;s</th><th>min &micro;s</th><th>TFLOP/s</th><th>effective TB/s</th><th>speed-up vs fly_yash</th></tr>
+<tr><td>one-query kernel (<code>fly_one_q</code>) <span class="neu">(separate run, same setup)</span></td><td>6175</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>0.65x</td></tr>
+<tr><td>Yash's kernel (<code>fly_yash</code>, ordered indices)</td><td>4041.0</td><td>3901.7</td><td>272.1</td><td>8.64</td><td>1.000x</td></tr>
+<tr><td><b>ping-pong, final (<code>fly_pp</code>)</b></td><td class="pos"><b>3836.9</b></td><td class="pos">3783.0</td><td class="pos">286.6</td><td class="pos">9.09</td><td class="pos"><b>1.053x</b></td></tr>
+</table>
+<p class="neu">Both kernels pass the fp32 oracle (max |err| 1.23e-3). Against the one-query kernel the final ping-pong is 6175 / 3837 = <b>1.61x</b> faster (the one_q number is from a separate run of the same setup).
+Effective TB/s is logical bytes (34.4 GB) over time, so 9 TB/s means the Infinity Cache serves most of the gathers.</p>
+<p><b>Also on MI300X</b> (flydsl 0.5.0; both are gfx942 and differ mainly in power cap): fly_yash 5125 &micro;s vs fly_pp 5144 &micro;s, <b>0.996x (par)</b>, 6.81 vs 6.78 TB/s. On MI300X Yash's kernel is marginally ahead.</p>
+
+<!-- ============================================================ -->
+<h2>10. Takeaways</h2>
+<div class="card">
+<ol>
+  <li><b>Ping-pong also works when the slack is memory latency, not VALU.</b> The skew turned the exposed index/gather waits into overlap: ~18% matrix-core utilisation in the one-query kernel, and a 1.23x speed-up from the schedule plus gather work.</li>
+  <li><b>But the schedule is only the structure.</b> The first version was 0.974x; almost all the gain came from making the <em>gather</em> efficient: coalescable loads so the L1 stops tag-conflicting (0.944x), interleaving the fix-up with the MFMAs (0.917x), and spreading loads through both phases (0.749x on MI325X).</li>
+  <li><b>Read the counters, not just the trace.</b> The stall was inside the CU (TA 95% busy, 65% tag conflicts), not in the fabric. After the fix it moved to L1-waiting-on-L2, and further issue-order games bought nothing.</li>
+  <li><b>On a power-capped part, judge by energy per tile.</b> The depth-1 prefetch needed 7% more cycles and still won, through a higher clock; fewer-cycles changes can lose the same way.</li>
+  <li><b>Ping-pong is not the only way to hide waits.</b> Yash's one-wave-per-token kernel reaches the same level by removing the waits outright. The ping-pong version has the clearer structure and is easier to steer (&ldquo;the pp pipeline has better visualization&rdquo;), and the best ideas moved across: his steady stream of loads cut the ping-pong kernel's time by 25% on MI325X (5096 &rarr; 3814 &micro;s).</li>
+  <li><b>Check the regimes it does not help.</b> Ping-pong needs full occupancy (T &gt; ~4K); it regresses for tiny T, L2-resident data, shuffled lists and the HBM-bound 4 GiB uniform stress case.</li>
+</ol>
+</div>
+
+</section><!-- /page-spmla -->
+
+
+</main>
+<footer>
+<h3>Code</h3>
+<ul>
+  <li>FP8 FMHA ping-pong (gfx950): <a href="https://github.com/AMD-AGI/diffusion-models-inference-private/tree/zhuo/mha_flydsl/flydsl">AMD-AGI/diffusion-models-inference-private &middot; zhuo/mha_flydsl &middot; flydsl/</a></li>
+  <li>HSTU backward (fused dV/dK/dQ + reduce): <a href="https://github.com/ROCm/aiter/pull/6175">ROCm/aiter PR #6175</a></li>
+  <li>HSTU forward ping-pong: <a href="https://github.com/ROCm/aiter/pull/8062">ROCm/aiter PR #8062</a></li>
+  <li>Sparse MLA (FlyDSL, gfx942): <a href="https://github.com/ROCm/aiter/tree/ws/glm53-sparse-mla-flydsl">ROCm/aiter &middot; ws/glm53-sparse-mla-flydsl</a>
+      &mdash; <code>python3 op_tests/test_flydsl_sparse_mla.py --suite performance -t 16384 --order logical topk -s 0 1</code></li>
+</ul>
+<h3>Acknowledgements</h3>
+<p>Nico Holmberg for the HSTU end-to-end measurements and the CK / H100 comparisons; Folkert for the idea of fusing dQ into the dV/dK kernel; Yash for the non-ping-pong sparse MLA kernel and the steady-load-stream idea.
+Figure 1 on page 1 is reproduced from <a href="https://arxiv.org/pdf/2611.09225">arXiv 2611.09225</a>. Traces were captured with rocprofv3 ATT and viewed in WaveScope.</p>
+</footer>
+
+<script>
+(function(){
+  // 3 shown phases; wave A = wavefront 0 (g0), wave B = wavefront 4 (g1), one SIMD
+  const A = [
+    ["S₀=Q₀K₀","m"], ["P₀=softmax","v"], ["O=P₀V₀ + S₁=Q₀K₁","m"],
+    ["P₁=softmax","v"], ["O=P₁V₁ + S₂=Q₀K₂","m"]];
+  const B = [
+    ["(wait)","idle"], ["S₀=Q₄K₀","m"], ["P₀=softmax","v"],
+    ["O=P₀V₀ + S₁=Q₄K₁","m"], ["P₁=softmax","v"]];
+  const notes = [
+    "Phase 0: g0 (wavefront 0) computes S₀ on the matrix core. g1 (wavefront 4) has nothing yet; this is the skew being established.",
+    "Phase 1: g0 runs softmax on VALU while g1 runs its S₀ MFMA. Matrix core busy (g1), VALU busy (g0).",
+    "Phase 2: roles swap. g0 does PV + next QK on the matrix core; g1 does softmax on VALU.",
+    "Phase 3: swap again. Steady state: every barrier interval, one wave is in MFMA and the other in softmax.",
+    "Phase 4: same thing one more time. The loop body is these two phases repeated, with g1 simply starting at the softmax."];
+  const tl = document.getElementById('tl');
+  function lane(name, arr){
+    const l = document.createElement('div'); l.className='lane';
+    l.innerHTML = '<div class="nm">'+name+'</div>';
+    const c = document.createElement('div'); c.className='cells';
+    arr.forEach(([t,k])=>{ const d=document.createElement('div'); d.className='cell '+k; d.textContent=t; c.appendChild(d); });
+    l.appendChild(c); tl.appendChild(l); return c;
+  }
+  const ca = lane('SIMD0 / wavefront 0 (g0)', A);
+  const cb = lane('SIMD0 / wavefront 4 (g1)', B);
+  const bl = document.createElement('div'); bl.className='barline';
+  for(let i=0;i<A.length;i++){ const d=document.createElement('div'); d.textContent='s_barrier'; bl.appendChild(d); }
+  tl.appendChild(bl);
+  let cur = 0, timer = null;
+  function show(i){
+    cur = (i + A.length) % A.length;
+    [ca,cb].forEach(c=>[...c.children].forEach((e,j)=>{ e.classList.toggle('now', j===cur); e.style.opacity = j<=cur ? 1 : .35; }));
+    document.getElementById('ph').textContent = cur;
+    document.getElementById('tlnote').textContent = notes[cur];
+  }
+  document.getElementById('prev').onclick = ()=>show(cur-1);
+  document.getElementById('next').onclick = ()=>show(cur+1);
+  document.getElementById('play').onclick = function(){
+    if(timer){ clearInterval(timer); timer=null; this.innerHTML='&#9654; play'; }
+    else { timer=setInterval(()=>show(cur+1), 1400); this.innerHTML='&#10074;&#10074; pause'; }
+  };
+  show(0);
+})();
+</script>
+<script>
+(function(){
+  // ---- tabs (hash-routed so reload keeps the page) ----
+  const btns = document.querySelectorAll('nav.tabs button');
+  function go(p){
+    if(!document.getElementById('page-'+p)) p='fp8';
+    document.querySelectorAll('section.page').forEach(s=>s.classList.toggle('on', s.id==='page-'+p));
+    btns.forEach(b=>b.classList.toggle('on', b.dataset.page===p));
+    history.replaceState(null,'','#'+p); window.scrollTo(0,0);
+  }
+  btns.forEach(b=>b.onclick=()=>go(b.dataset.page));
+  go(location.hash.slice(1)||'fp8');
+
+
+  // ---- fused-kernel progression bars ----
+  const pts = [
+    ["ds_add_f32 cross-wave sum", 1915.6],
+    ["per-wave slots summed in phase V", 409.1],
+    ["register transposes + wide LDS reads", 380.3],
+    ["flush / exchange hidden under the gate", 362.7],
+    ["trimmed burst: prefetch window, interleave, branches", 337.7]
+  ];
+  const host = document.getElementById('fusedbars');
+  const max = 460; // clip the first bar so the rest stay readable
+  pts.forEach(([l,v])=>{
+    const d=document.createElement('div'); d.className='bar';
+    const w=Math.min(v,max)/max*100;
+    d.innerHTML='<div class="lb">'+l+'</div><div class="fill" style="width:'+(w*0.55)+'%"></div><div class="v">'+v.toFixed(1)+(v>max?' ms (bar clipped)':' ms')+'</div>';
+    host.appendChild(d);
+  });
+})();
+</script>
+<script>
+(function(){
+  // ---------- sigma / LUT model (mirrors the kernel: fmamk -> med3 -> mask) ----------
+  const H=0.01125, GLO=-8, GHI=16, N=Math.ceil((GHI-GLO)/H)+1;
+  const SCALE=Math.fround(1/H), BIG=2097152+711.5, LO=2097152, HI=2097152+(N-1);
+  const f32=new Float32Array(1), u32=new Uint32Array(f32.buffer);
+  const sig=g=>1/(1+Math.pow(2,g));
+  function lut(g){
+    const g32=Math.fround(g);
+    const t=Math.fround(g32*SCALE+BIG);
+    const tc=Math.min(Math.max(t,LO),HI);
+    f32[0]=tc; const bits=u32[0];
+    const idx=(bits>>>2)&0x1FFFFF, addr=bits&0x7FFFFC, mant=bits&0x7FFFFF;
+    const gi=GLO+idx*H, s=sig(gi);
+    return {g:g32,t,tc,bits,idx,addr,mant,gi,s};
+  }
+  const fmt=(x,d=6)=>Number.isFinite(x)?(Math.abs(x)>=1e5||(Math.abs(x)<1e-3&&x!==0)?x.toExponential(4):x.toFixed(d)):'—';
+
+  // ---------- p(g) plot: exact vs sigma-table vs p-table ----------
+  const pc=document.getElementById('pplot');
+  if(pc){
+    const c=pc.getContext('2d'), W=pc.width, Ht=pc.height, x0=-30,x1=30,y0=-32,y1=6;
+    const X=x=>(x-x0)/(x1-x0)*(W-50)+40, Y=y=>(1-(y-y0)/(y1-y0))*(Ht-30)+10;
+    c.fillStyle='#0b0d12'; c.fillRect(0,0,W,Ht);
+    c.fillStyle='rgba(110,168,254,.08)'; c.fillRect(X(GLO),10,X(GHI)-X(GLO),Ht-30);
+    c.strokeStyle='#3a4150'; c.lineWidth=1; c.beginPath(); c.moveTo(X(x0),Y(0)); c.lineTo(X(x1),Y(0)); c.moveTo(X(0),10); c.lineTo(X(0),Ht-20); c.stroke();
+    c.fillStyle='#9aa3b2'; c.font='12px sans-serif';
+    [-30,-20,-10,0,10,20,30].forEach(v=>c.fillText(v,X(v)-8,Ht-6));
+    [-30,-20,-10,0].forEach(v=>c.fillText(v,6,Y(v)+4));
+    c.fillText('g',W-14,Y(0)-6); c.fillText('table range [-8,16]',X(GLO)+6,22);
+    const pe=g=>g*sig(g), pt=g=>{const gc=Math.min(Math.max(g,GLO),GHI);return gc*sig(gc);}, ps=g=>{const gc=Math.min(Math.max(g,GLO),GHI);return g*sig(gc);};
+    const draw=(f,col,w,dash)=>{c.strokeStyle=col;c.lineWidth=w;c.setLineDash(dash||[]);c.beginPath();for(let g=x0;g<=x1;g+=0.1){const x=X(g),y=Y(f(g));g===x0?c.moveTo(x,y):c.lineTo(x,y);}c.stroke();c.setLineDash([]);};
+    draw(pt,'#ff9b9b',2,[6,4]); draw(ps,'#8de8a0',3); draw(pe,'#ffffff',1.2);
+    c.fillStyle='#ff9b9b'; c.fillText('p-table: flat below g=-8, wrong by |g|',X(-29),Y(-8)-8);
+    c.fillStyle='#8de8a0'; c.fillText('sigma-table x g: tracks the exact curve',X(-29),Y(-26));
+  }
+
+  // ---------- interactive calculator ----------
+  const rng=document.getElementById('g_rng'), num=document.getElementById('g_num'), out=document.getElementById('lut_out'), sc=document.getElementById('sigplot');
+  if(rng&&num&&out&&sc){
+    [0,0.3,1,-2,-8,16,40,-100,-3455].forEach(v=>{const b=document.createElement('button');b.textContent='g = '+v;b.onclick=()=>{num.value=v;upd(v);};document.getElementById('g_chips').appendChild(b);});
+    function upd(g){
+      g=Number(g); if(!Number.isFinite(g)) return; rng.value=g; num.value=g;
+      const r=lut(g), se=sig(r.g), pl=r.g*r.s, pe=r.g*se, rel=(pe!==0)?Math.abs(pl-pe)/Math.abs(pe):NaN;
+      const hex='0x'+(r.bits>>>0).toString(16).toUpperCase().padStart(8,'0');
+      const clamped=r.t<LO?'clamped LOW (index 0)':(r.t>HI?'clamped HIGH (last node)':'in range');
+      out.innerHTML=[
+        ['t = fma(g, 1/h, 2^21+711.5)',fmt(r.t,2)],
+        ['after med3 clamp',fmt(r.tc,2)+'  ('+clamped+')'],
+        ['bits(t)',hex],
+        ['exponent / mantissa m','148 / '+r.mant],
+        ['byte address = bits & 0x7FFFFC',r.addr],
+        ['node index = addr / 4',r.idx],
+        ['node g_i',fmt(r.gi,5)],
+        ['sigma from table',fmt(r.s,7)],
+        ['sigma exact',fmt(se,7)],
+        ['p = g * sigma (table)',fmt(pl,5)],
+        ['p exact',fmt(pe,5)],
+        ['rel. error of p',Number.isFinite(rel)?(rel*100).toFixed(3)+' %':'—']
+      ].map(([a,b])=>'<tr><td>'+a+'</td><td>'+b+'</td></tr>').join('');
+      // plot
+      const c=sc.getContext('2d'),W=sc.width,Ht=sc.height,x0=-12,x1=20,X=x=>(x-x0)/(x1-x0)*(W-50)+40,Y=y=>(1-y)*(Ht-40)+16;
+      c.fillStyle='#0b0d12'; c.fillRect(0,0,W,Ht);
+      c.fillStyle='rgba(255,155,155,.10)'; c.fillRect(X(x0),16,X(GLO)-X(x0),Ht-40); c.fillRect(X(GHI),16,X(x1)-X(GHI),Ht-40);
+      c.fillStyle='#9aa3b2'; c.font='12px sans-serif';
+      c.fillText('clamp: node 0',X(x0)+6,30); c.fillText('clamp: last node',X(GHI)+6,30);
+      [-10,-8,0,10,16,20].forEach(v=>c.fillText(v,X(v)-8,Ht-6));
+      [0,0.5,1].forEach(v=>c.fillText(v,8,Y(v)+4));
+      c.strokeStyle='#ffffff'; c.lineWidth=2; c.beginPath();
+      for(let x=x0;x<=x1;x+=0.05){const px=X(x),py=Y(sig(x)); x===x0?c.moveTo(px,py):c.lineTo(px,py);} c.stroke();
+      const gx=Math.min(Math.max(r.g,x0),x1);
+      c.strokeStyle='#ffcb6b'; c.setLineDash([5,4]); c.lineWidth=1.5; c.beginPath(); c.moveTo(X(gx),16); c.lineTo(X(gx),Ht-24); c.stroke(); c.setLineDash([]);
+      c.fillStyle='#ffcb6b'; c.fillText('g'+(r.g<x0||r.g>x1?' (off plot)':''),X(gx)+4,Ht-28);
+      const nx=Math.min(Math.max(r.gi,x0),x1);
+      c.fillStyle='#8de8a0'; c.beginPath(); c.arc(X(nx),Y(r.s),6,0,6.3); c.fill();
+      c.fillText('node sigma='+r.s.toFixed(4),X(nx)+10,Y(r.s)-10);
+    }
+    rng.oninput=()=>upd(rng.value); num.oninput=()=>upd(num.value);
+    upd(0.3);
+  }
+
+  // ---------- progression bars: four stages ----------
+  const host=document.getElementById('fwdbars');
+  if(host){
+    [["1  shipping kernel",1.00],
+     ["2  + ping-pong framework",1.03],
+     ["3  + optimisations, before LUT",1.269],
+     ["4  final kernel (with LUT)",1.59]].forEach(([l,v])=>{
+      const d=document.createElement('div'); d.className='bar';
+      d.innerHTML='<div class="lb" style="width:260px">'+l+'</div><div class="fill" style="width:'+(v/1.7*55)+'%"></div><div class="v">'+v.toFixed(2)+'x</div>';
+      host.appendChild(d);
+    });
+  }
+})();
+</script>
+<script>
+(function(){
+  const host=document.getElementById('spbars'); if(!host) return;
+  [["1  first ping-pong version (MI300X)",0.974],
+   ["2  + V^T by identity MFMAs",0.952],
+   ["3  + coalescable gather + bpermute",0.889],
+   ["4  + interleave bpermute with MFMAs",0.821],
+   ["5  + prefetch depth 1 and Q-read spread",0.815],
+   ["6  + gather_in_m=4 (MI325X)",0.618]].forEach(([l,v])=>{
+    const d=document.createElement('div'); d.className='bar';
+    d.innerHTML='<div class="lb" style="width:340px">'+l+'</div><div class="fill" style="width:'+(v*60)+'%"></div><div class="v">'+v.toFixed(3)+'x</div>';
+    host.appendChild(d);
+  });
+})();
+</script>
+<script>
+(function(){
+  const host=document.getElementById('spfinal'); if(!host) return;
+  [["one-query kernel",6175,"#6f7686"],["Yash's kernel (non-pp)",4041,"#6ea8fe"],["ping-pong, final",3836.9,"#8de8a0"]].forEach(([l,v,c])=>{
+    const d=document.createElement('div'); d.className='bar';
+    d.innerHTML='<div class="lb" style="width:200px">'+l+'</div><div class="fill" style="width:'+(v/6500*55)+'%;background:'+c+'"></div><div class="v">'+v.toFixed(0)+' &micro;s</div>';
+    host.appendChild(d);
+  });
+})();
+</script>
+</body>
+</html>
