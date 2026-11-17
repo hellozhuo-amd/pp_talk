@@ -62,7 +62,6 @@
   .slot b { color:#ffcb6b; font-family:ui-monospace,monospace; }
   figure.slotfig { margin:20px 0; }
   figure.slotfig img { background:#0b0d12; }
-  footer { max-width:1100px; margin:0 auto; padding:0 24px 48px; color:var(--dim); font-size:.9rem; border-top:1px solid #2a2f3a; }
   .ph-table td.ph { color:#ffcb6b; text-align:center; }
   .pos { color:#8de8a0; } .neg { color:#ff9b9b; } .neu { color:var(--dim); }
   table.tricks td:first-child { white-space:nowrap; font-family:ui-monospace,monospace; font-size:.82rem; }
@@ -1145,19 +1144,6 @@ Effective TB/s is logical bytes (34.4 GB) over time, so 9 TB/s means the Infinit
 
 
 </main>
-<footer>
-<h3>Code</h3>
-<ul>
-  <li>FP8 FMHA ping-pong (gfx950): <a href="https://github.com/AMD-AGI/diffusion-models-inference-private/tree/zhuo/mha_flydsl/flydsl">AMD-AGI/diffusion-models-inference-private &middot; zhuo/mha_flydsl &middot; flydsl/</a></li>
-  <li>HSTU backward (fused dV/dK/dQ + reduce): <a href="https://github.com/ROCm/aiter/pull/6175">ROCm/aiter PR #6175</a></li>
-  <li>HSTU forward ping-pong: <a href="https://github.com/ROCm/aiter/pull/8062">ROCm/aiter PR #8062</a></li>
-  <li>Sparse MLA (FlyDSL, gfx942): <a href="https://github.com/ROCm/aiter/tree/ws/glm53-sparse-mla-flydsl">ROCm/aiter &middot; ws/glm53-sparse-mla-flydsl</a>
-      &mdash; <code>python3 op_tests/test_flydsl_sparse_mla.py --suite performance -t 16384 --order logical topk -s 0 1</code></li>
-</ul>
-<h3>Acknowledgements</h3>
-<p>Nico Holmberg for the HSTU end-to-end measurements and the CK / H100 comparisons; Folkert for the idea of fusing dQ into the dV/dK kernel; Yash for the non-ping-pong sparse MLA kernel and the steady-load-stream idea.
-Figure 1 on page 1 is reproduced from <a href="https://arxiv.org/pdf/2611.09225">arXiv 2611.09225</a>. Traces were captured with rocprofv3 ATT and viewed in WaveScope.</p>
-</footer>
 
 <script>
 (function(){
